@@ -17,7 +17,7 @@ import (
 // The Manager provides a high-level API for:
 //   - Storing failed messages in the DLQ
 //   - Listing and filtering DLQ messages
-//   - Replaying messages back to their original events
+//   - Replaying messages back to their original events with optional retry and backoff
 //   - Cleaning up old messages
 //   - Getting DLQ statistics
 //
@@ -39,9 +39,116 @@ import (
 //	stats, _ := manager.Stats(ctx)
 //	fmt.Printf("Pending: %d\n", stats.PendingMessages)
 type Manager struct {
-	store     Store
-	transport transport.Transport
-	logger    *slog.Logger
+	store      Store
+	transport  transport.Transport
+	logger     *slog.Logger
+	metrics    *Metrics
+	backoff    BackoffStrategy
+	maxRetries int
+}
+
+// BackoffStrategy defines a backoff strategy for retry logic.
+//
+// Implementations must be safe for concurrent use.
+type BackoffStrategy interface {
+	// NextDelay returns the delay for the given attempt (0-indexed).
+	// Attempt 0 is the first retry, not the initial attempt.
+	NextDelay(attempt int) time.Duration
+
+	// Reset resets the strategy state if any.
+	Reset()
+}
+
+// managerOptions holds configuration for Manager (unexported)
+type managerOptions struct {
+	logger     *slog.Logger
+	metrics    *Metrics
+	backoff    BackoffStrategy
+	maxRetries int
+}
+
+// ManagerOption is a functional option for configuring Manager
+type ManagerOption func(*managerOptions)
+
+// WithLogger sets a custom logger for the manager.
+//
+// The logger is used for info and error messages during DLQ operations.
+func WithLogger(l *slog.Logger) ManagerOption {
+	return func(o *managerOptions) {
+		if l != nil {
+			o.logger = l
+		}
+	}
+}
+
+// WithMetrics enables OpenTelemetry metrics for the manager.
+//
+// When metrics are enabled, the manager records:
+//   - dlq_messages_total: Messages sent to DLQ
+//   - dlq_messages_replayed_total: Messages replayed
+//   - dlq_messages_deleted_total: Messages deleted
+//   - dlq_messages_pending: Current pending messages
+//   - dlq_replay_success_total: Successful replays
+//   - dlq_replay_failure_total: Failed replays
+//
+// Example:
+//
+//	metrics, _ := dlq.NewMetrics()
+//	manager := dlq.NewManager(store, transport, dlq.WithMetrics(metrics))
+func WithMetrics(m *Metrics) ManagerOption {
+	return func(o *managerOptions) {
+		o.metrics = m
+	}
+}
+
+// WithBackoff sets a backoff strategy for replay retries.
+//
+// When a replay fails, this strategy determines how long to wait before
+// retrying. Combined with WithMaxRetries, this enables automatic retry
+// of transient failures during replay.
+//
+// If not set, failed replays are not retried automatically.
+//
+// Example:
+//
+//	// Using the event library's backoff package
+//	import "github.com/rbaliyan/event/v3/backoff"
+//
+//	manager := dlq.NewManager(store, transport,
+//	    dlq.WithBackoff(&backoff.Exponential{
+//	        Initial:    time.Second,
+//	        Multiplier: 2.0,
+//	        Max:        30 * time.Second,
+//	        Jitter:     0.1,
+//	    }),
+//	    dlq.WithMaxRetries(3),
+//	)
+func WithBackoff(strategy BackoffStrategy) ManagerOption {
+	return func(o *managerOptions) {
+		o.backoff = strategy
+	}
+}
+
+// WithMaxRetries sets the maximum number of retry attempts for replay.
+//
+// When a replay fails, it will be retried up to this many times before
+// being skipped. Use this in combination with WithBackoff to configure
+// the delay between retries.
+//
+// If set to 0 (default), failed replays are not retried.
+//
+// Example:
+//
+//	manager := dlq.NewManager(store, transport,
+//	    dlq.WithBackoff(backoffStrategy),
+//	    dlq.WithMaxRetries(3),
+//	)
+func WithMaxRetries(max int) ManagerOption {
+	return func(o *managerOptions) {
+		if max >= 0 {
+			o.maxRetries = max
+		}
+	}
 }
 
 // NewManager creates a new DLQ manager.
@@ -52,25 +159,36 @@ type Manager struct {
 // Parameters:
 //   - store: DLQ storage implementation
 //   - t: Transport for publishing replayed messages
+//   - opts: Optional configuration (logger, metrics, backoff, etc.)
 //
 // Example:
 //
 //	store := dlq.NewRedisStore(redisClient)
 //	manager := dlq.NewManager(store, transport)
-func NewManager(store Store, t transport.Transport) *Manager {
-	return &Manager{
-		store:     store,
-		transport: t,
-		logger:    slog.Default().With("component", "dlq.manager"),
-	}
-}
-
-// WithLogger sets a custom logger.
 //
-// The logger is used for info and error messages during DLQ operations.
-func (m *Manager) WithLogger(l *slog.Logger) *Manager {
-	m.logger = l
-	return m
+//	// With metrics and retry backoff
+//	metrics, _ := dlq.NewMetrics()
+//	manager := dlq.NewManager(store, transport,
+//	    dlq.WithMetrics(metrics),
+//	    dlq.WithBackoff(backoffStrategy),
+//	    dlq.WithMaxRetries(3),
+//	)
+func NewManager(store Store, t transport.Transport, opts ...ManagerOption) *Manager {
+	o := &managerOptions{
+		logger: slog.Default().With("component", "dlq.manager"),
+	}
+	for _, opt := range opts {
+		opt(o)
+	}
+
+	return &Manager{
+		store:      store,
+		transport:  t,
+		logger:     o.logger,
+		metrics:    o.metrics,
+		backoff:    o.backoff,
+		maxRetries: o.maxRetries,
+	}
 }
 
 // Store adds a failed message to the DLQ.
@@ -100,13 +218,14 @@ func (m *Manager) WithLogger(l *slog.Logger) *Manager {
 //	        msg.Metadata, err, maxRetries, "order-service")
 //	}
 func (m *Manager) Store(ctx context.Context, eventName, originalID string, payload []byte, metadata map[string]string, err error, retryCount int, source string) error {
+	errMsg := err.Error()
 	msg := &Message{
 		ID:         uuid.New().String(),
 		EventName:  eventName,
 		OriginalID: originalID,
 		Payload:    payload,
 		Metadata:   metadata,
-		Error:      err.Error(),
+		Error:      errMsg,
 		RetryCount: retryCount,
 		CreatedAt:  time.Now(),
 		Source:     source,
@@ -119,6 +238,9 @@ func (m *Manager) Store(ctx context.Context, eventName, originalID string, paylo
 			"error", storeErr)
 		return fmt.Errorf("store dlq message: %w", storeErr)
 	}
+
+	// Record metrics
+	m.metrics.RecordMessageStored(ctx, eventName, errMsg)
 
 	m.logger.Info("stored message in DLQ",
 		"id", msg.ID,
@@ -150,6 +272,9 @@ func (m *Manager) Count(ctx context.Context, filter Filter) (int64, error) {
 // metadata indicating they are DLQ replays. Successfully replayed messages
 // are marked as retried.
 //
+// If backoff and maxRetries are configured, each message replay will be
+// retried with increasing delays before being skipped.
+//
 // The replay continues even if some messages fail to replay, logging errors
 // for failed messages.
 //
@@ -176,11 +301,13 @@ func (m *Manager) Replay(ctx context.Context, filter Filter) (int, error) {
 
 	replayed := 0
 	for _, msg := range messages {
-		if err := m.replayMessage(ctx, msg); err != nil {
+		if err := m.replayMessageWithRetry(ctx, msg); err != nil {
 			m.logger.Error("failed to replay message",
 				"id", msg.ID,
 				"event", msg.EventName,
 				"error", err)
+			// Record replay failure metric
+			m.metrics.RecordReplayFailure(ctx, msg.EventName, err.Error())
 			continue
 		}
 
@@ -189,6 +316,10 @@ func (m *Manager) Replay(ctx context.Context, filter Filter) (int, error) {
 				"id", msg.ID,
 				"error", err)
 		}
+
+		// Record replay success metrics
+		m.metrics.RecordReplaySuccess(ctx, msg.EventName)
+		m.metrics.RecordMessageReplayed(ctx, msg.EventName)
 
 		replayed++
 	}
@@ -200,14 +331,19 @@ func (m *Manager) Replay(ctx context.Context, filter Filter) (int, error) {
 	return replayed, nil
 }
 
-// ReplaySingle replays a single DLQ message by ID
+// ReplaySingle replays a single DLQ message by ID.
+//
+// If backoff and maxRetries are configured, the replay will be retried
+// with increasing delays before returning an error.
 func (m *Manager) ReplaySingle(ctx context.Context, id string) error {
 	msg, err := m.store.Get(ctx, id)
 	if err != nil {
 		return fmt.Errorf("get message: %w", err)
 	}
 
-	if err := m.replayMessage(ctx, msg); err != nil {
+	if err := m.replayMessageWithRetry(ctx, msg); err != nil {
+		// Record replay failure metric
+		m.metrics.RecordReplayFailure(ctx, msg.EventName, err.Error())
 		return fmt.Errorf("replay message: %w", err)
 	}
 
@@ -215,12 +351,66 @@ func (m *Manager) ReplaySingle(ctx context.Context, id string) error {
 		return fmt.Errorf("mark retried: %w", err)
 	}
 
+	// Record replay success metrics
+	m.metrics.RecordReplaySuccess(ctx, msg.EventName)
+	m.metrics.RecordMessageReplayed(ctx, msg.EventName)
+
 	m.logger.Info("replayed single DLQ message",
 		"id", id,
 		"event", msg.EventName,
 		"original_id", msg.OriginalID)
 
 	return nil
+}
+
+// replayMessageWithRetry replays a message with optional retry and backoff.
+func (m *Manager) replayMessageWithRetry(ctx context.Context, msg *Message) error {
+	maxAttempts := m.maxRetries + 1 // +1 for the initial attempt
+	if maxAttempts < 1 {
+		maxAttempts = 1
+	}
+
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		// Wait for backoff delay on retry (not on first attempt)
+		if attempt > 0 && m.backoff != nil {
+			backoffDelay := m.backoff.NextDelay(attempt - 1)
+			m.logger.Info("retrying replay after backoff",
+				"id", msg.ID,
+				"event", msg.EventName,
+				"attempt", attempt+1,
+				"backoff_delay", backoffDelay)
+
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(backoffDelay):
+				// Continue with retry
+			}
+		}
+
+		lastErr = m.replayMessage(ctx, msg)
+		if lastErr == nil {
+			return nil // Success
+		}
+
+		// Log retry attempt
+		if attempt < maxAttempts-1 {
+			m.logger.Warn("replay failed, will retry",
+				"id", msg.ID,
+				"event", msg.EventName,
+				"attempt", attempt+1,
+				"max_attempts", maxAttempts,
+				"error", lastErr)
+		}
+	}
+
+	// Reset backoff after all attempts
+	if m.backoff != nil {
+		m.backoff.Reset()
+	}
+
+	return lastErr
 }
 
 // replayMessage publishes a message back to its original event
@@ -248,12 +438,31 @@ func (m *Manager) replayMessage(ctx context.Context, msg *Message) error {
 
 // Delete removes a message from the DLQ
 func (m *Manager) Delete(ctx context.Context, id string) error {
-	return m.store.Delete(ctx, id)
+	// Get message first to record metrics with event name
+	msg, err := m.store.Get(ctx, id)
+	if err != nil {
+		return err
+	}
+
+	if err := m.store.Delete(ctx, id); err != nil {
+		return err
+	}
+
+	// Record delete metric
+	m.metrics.RecordMessageDeleted(ctx, msg.EventName)
+	return nil
 }
 
 // DeleteByFilter removes messages matching the filter
 func (m *Manager) DeleteByFilter(ctx context.Context, filter Filter) (int64, error) {
-	return m.store.DeleteByFilter(ctx, filter)
+	deleted, err := m.store.DeleteByFilter(ctx, filter)
+	if err != nil {
+		return 0, err
+	}
+
+	// Record bulk delete metric
+	m.metrics.RecordBulkDeleted(ctx, deleted)
+	return deleted, nil
 }
 
 // Cleanup removes messages older than the specified age
@@ -264,6 +473,9 @@ func (m *Manager) Cleanup(ctx context.Context, age time.Duration) (int64, error)
 	}
 
 	if deleted > 0 {
+		// Record bulk delete metric
+		m.metrics.RecordBulkDeleted(ctx, deleted)
+
 		m.logger.Info("cleaned up old DLQ messages",
 			"deleted", deleted,
 			"older_than", age)

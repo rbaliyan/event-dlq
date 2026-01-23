@@ -115,7 +115,7 @@ func main() {
 	// ============================================================
 
 	dlqStore := dlq.NewMongoStore(internalDB).WithCollection("_dlq")
-	dlqManager := dlq.NewManager(dlqStore, transport).WithLogger(logger)
+	dlqManager := dlq.NewManager(dlqStore, transport, dlq.WithLogger(logger))
 
 	// ============================================================
 	// STEP 4: Create Event Bus

@@ -4,7 +4,7 @@ go 1.24.0
 
 require (
 	github.com/google/uuid v1.6.0
-	github.com/rbaliyan/event/v3 v3.0.0
+	github.com/rbaliyan/event/v3 v3.6.1
 	github.com/redis/go-redis/v9 v9.17.2
 	go.mongodb.org/mongo-driver v1.17.6
 	go.opentelemetry.io/otel/trace v1.39.0
@@ -32,5 +32,3 @@ require (
 	golang.org/x/text v0.31.0 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
 )
-
-replace github.com/rbaliyan/event/v3 => ../event

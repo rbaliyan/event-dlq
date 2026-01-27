@@ -218,7 +218,12 @@ func NewManager(store Store, t transport.Transport, opts ...ManagerOption) *Mana
 //	        msg.Metadata, err, maxRetries, "order-service")
 //	}
 func (m *Manager) Store(ctx context.Context, eventName, originalID string, payload []byte, metadata map[string]string, err error, retryCount int, source string) error {
-	errMsg := err.Error()
+	var errMsg string
+	if err != nil {
+		errMsg = err.Error()
+	} else {
+		errMsg = "unknown error"
+	}
 	msg := &Message{
 		ID:         uuid.New().String(),
 		EventName:  eventName,
@@ -364,6 +369,8 @@ func (m *Manager) ReplaySingle(ctx context.Context, id string) error {
 }
 
 // replayMessageWithRetry replays a message with optional retry and backoff.
+// Each invocation computes delays based on the attempt index passed to
+// NextDelay, avoiding shared mutable backoff state between concurrent calls.
 func (m *Manager) replayMessageWithRetry(ctx context.Context, msg *Message) error {
 	maxAttempts := m.maxRetries + 1 // +1 for the initial attempt
 	if maxAttempts < 1 {
@@ -403,11 +410,6 @@ func (m *Manager) replayMessageWithRetry(ctx context.Context, msg *Message) erro
 				"max_attempts", maxAttempts,
 				"error", lastErr)
 		}
-	}
-
-	// Reset backoff after all attempts
-	if m.backoff != nil {
-		m.backoff.Reset()
 	}
 
 	return lastErr

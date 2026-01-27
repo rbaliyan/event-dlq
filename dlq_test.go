@@ -3,6 +3,7 @@ package dlq
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -562,4 +563,122 @@ func TestManager(t *testing.T) {
 			t.Errorf("expected 2 total, got %d", stats.TotalMessages)
 		}
 	})
+
+	t.Run("Store with nil error does not panic", func(t *testing.T) {
+		store := NewMemoryStore()
+		tr := &mockTransport{}
+		manager := NewManager(store, tr)
+
+		err := manager.Store(ctx, "order.created", "msg-123", []byte(`{"id":"order-1"}`),
+			map[string]string{"key": "value"}, nil, 3, "order-service")
+
+		if err != nil {
+			t.Fatalf("Store with nil error failed: %v", err)
+		}
+
+		messages, _ := store.List(ctx, Filter{})
+		if len(messages) != 1 {
+			t.Fatalf("expected 1 message, got %d", len(messages))
+		}
+		if messages[0].Error != "unknown error" {
+			t.Errorf("expected error 'unknown error', got %q", messages[0].Error)
+		}
+	})
+
+	t.Run("Manager works without metrics (nil metrics)", func(t *testing.T) {
+		store := NewMemoryStore()
+		tr := &mockTransport{}
+		// No WithMetrics option -- metrics is nil
+		manager := NewManager(store, tr)
+
+		// Store
+		err := manager.Store(ctx, "event", "msg-1", []byte("data"), nil, errors.New("fail"), 1, "src")
+		if err != nil {
+			t.Fatalf("Store failed: %v", err)
+		}
+
+		// Replay
+		replayed, err := manager.Replay(ctx, Filter{})
+		if err != nil {
+			t.Fatalf("Replay failed: %v", err)
+		}
+		if replayed != 1 {
+			t.Errorf("expected 1 replayed, got %d", replayed)
+		}
+
+		// ReplaySingle (store another message first)
+		store.Store(ctx, &Message{ID: "dlq-single", EventName: "event", OriginalID: "msg-2", CreatedAt: time.Now()})
+		if err := manager.ReplaySingle(ctx, "dlq-single"); err != nil {
+			t.Fatalf("ReplaySingle failed: %v", err)
+		}
+
+		// Delete
+		store.Store(ctx, &Message{ID: "dlq-del", EventName: "event", CreatedAt: time.Now()})
+		if err := manager.Delete(ctx, "dlq-del"); err != nil {
+			t.Fatalf("Delete failed: %v", err)
+		}
+
+		// DeleteByFilter
+		store.Store(ctx, &Message{ID: "dlq-bf", EventName: "event", CreatedAt: time.Now()})
+		if _, err := manager.DeleteByFilter(ctx, Filter{EventName: "event"}); err != nil {
+			t.Fatalf("DeleteByFilter failed: %v", err)
+		}
+
+		// Cleanup
+		store.Store(ctx, &Message{ID: "dlq-old", EventName: "event", CreatedAt: time.Now().Add(-2 * time.Hour)})
+		if _, err := manager.Cleanup(ctx, time.Hour); err != nil {
+			t.Fatalf("Cleanup failed: %v", err)
+		}
+	})
+
+	t.Run("Concurrent Replay calls do not interfere with backoff", func(t *testing.T) {
+		store := NewMemoryStore()
+		tr := &mockTransport{failOn: "fail.event"}
+		backoff := &testBackoff{}
+		manager := NewManager(store, tr,
+			WithBackoff(backoff),
+			WithMaxRetries(2),
+		)
+
+		// Store messages that will fail replay (transport fails on "fail.event")
+		for i := 0; i < 5; i++ {
+			store.Store(ctx, &Message{
+				ID:         fmt.Sprintf("dlq-concurrent-%d", i),
+				EventName:  "fail.event",
+				OriginalID: fmt.Sprintf("msg-%d", i),
+				Payload:    []byte("data"),
+				CreatedAt:  time.Now(),
+			})
+		}
+
+		var wg sync.WaitGroup
+		errs := make([]error, 3)
+		for i := 0; i < 3; i++ {
+			wg.Add(1)
+			go func(idx int) {
+				defer wg.Done()
+				_, errs[idx] = manager.Replay(ctx, Filter{})
+			}(i)
+		}
+		wg.Wait()
+
+		// All Replay calls should complete without panic or data race
+		for i, err := range errs {
+			if err != nil {
+				t.Errorf("Replay goroutine %d returned error: %v", i, err)
+			}
+		}
+	})
+}
+
+// testBackoff is a simple stateless backoff for testing.
+// NextDelay is safe for concurrent use because it has no mutable state.
+type testBackoff struct{}
+
+func (b *testBackoff) NextDelay(attempt int) time.Duration {
+	return time.Millisecond // minimal delay for tests
+}
+
+func (b *testBackoff) Reset() {
+	// no-op
 }

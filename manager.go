@@ -9,7 +9,6 @@ import (
 	"github.com/google/uuid"
 	"github.com/rbaliyan/event/v3/transport"
 	"github.com/rbaliyan/event/v3/transport/message"
-	"go.opentelemetry.io/otel/trace"
 )
 
 // Manager handles DLQ operations including replay.
@@ -432,7 +431,6 @@ func (m *Manager) replayMessage(ctx context.Context, msg *Message) error {
 		"dlq-replay",
 		msg.Payload, // Send raw payload
 		metadata,
-		trace.SpanContext{},
 	)
 
 	return m.transport.Publish(ctx, msg.EventName, transportMsg)

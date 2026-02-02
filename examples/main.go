@@ -23,7 +23,7 @@ import (
 	event "github.com/rbaliyan/event/v3"
 	"github.com/rbaliyan/event-dlq"
 	"github.com/rbaliyan/event/v3/outbox"
-	"github.com/rbaliyan/event/v3/transport/mongodb"
+	"github.com/rbaliyan/event-mongodb"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 )

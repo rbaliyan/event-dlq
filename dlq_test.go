@@ -286,6 +286,57 @@ func TestMemoryStore(t *testing.T) {
 		}
 	})
 
+	t.Run("GetByOriginalID", func(t *testing.T) {
+		store := NewMemoryStore()
+
+		msg := &Message{
+			ID:         "dlq-1",
+			EventName:  "order.created",
+			OriginalID: "msg-123",
+			Payload:    []byte(`{"id":"order-1"}`),
+			Metadata:   map[string]string{"key": "value"},
+			Error:      "processing failed",
+			RetryCount: 3,
+			CreatedAt:  time.Now(),
+			Source:     "order-service",
+		}
+
+		err := store.Store(ctx, msg)
+		if err != nil {
+			t.Fatalf("Store failed: %v", err)
+		}
+
+		retrieved, err := store.GetByOriginalID(ctx, "msg-123")
+		if err != nil {
+			t.Fatalf("GetByOriginalID failed: %v", err)
+		}
+
+		if retrieved.ID != "dlq-1" {
+			t.Errorf("expected ID dlq-1, got %s", retrieved.ID)
+		}
+		if retrieved.OriginalID != "msg-123" {
+			t.Errorf("expected original ID msg-123, got %s", retrieved.OriginalID)
+		}
+		if retrieved.EventName != "order.created" {
+			t.Errorf("expected event order.created, got %s", retrieved.EventName)
+		}
+		if string(retrieved.Payload) != `{"id":"order-1"}` {
+			t.Errorf("unexpected payload: %s", retrieved.Payload)
+		}
+	})
+
+	t.Run("GetByOriginalID not found", func(t *testing.T) {
+		store := NewMemoryStore()
+
+		_, err := store.GetByOriginalID(ctx, "non-existent")
+		if err == nil {
+			t.Error("expected error for non-existent original ID")
+		}
+		if !errors.Is(err, ErrNotFound) {
+			t.Errorf("expected ErrNotFound, got %v", err)
+		}
+	})
+
 	t.Run("concurrent access is safe", func(t *testing.T) {
 		store := NewMemoryStore()
 

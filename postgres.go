@@ -85,6 +85,7 @@ func (s *PostgresStore) EnsureTable(ctx context.Context) error {
 		fmt.Sprintf("CREATE INDEX IF NOT EXISTS idx_%s_event_name ON %s(event_name)", s.table, s.table),
 		fmt.Sprintf("CREATE INDEX IF NOT EXISTS idx_%s_created_at ON %s(created_at)", s.table, s.table),
 		fmt.Sprintf("CREATE INDEX IF NOT EXISTS idx_%s_retried_at ON %s(retried_at) WHERE retried_at IS NULL", s.table, s.table),
+		fmt.Sprintf("CREATE INDEX IF NOT EXISTS idx_%s_original_id ON %s(original_id)", s.table, s.table),
 	}
 
 	for _, idx := range indexes {
@@ -379,6 +380,46 @@ func (s *PostgresStore) Stats(ctx context.Context) (*Stats, error) {
 	}
 
 	return stats, nil
+}
+
+// GetByOriginalID retrieves a message by its original event message ID
+func (s *PostgresStore) GetByOriginalID(ctx context.Context, originalID string) (*Message, error) {
+	query := fmt.Sprintf(`
+		SELECT id, event_name, original_id, payload, metadata, error, retry_count, source, created_at, retried_at
+		FROM %s
+		WHERE original_id = $1
+	`, s.table)
+
+	var msg Message
+	var metadata []byte
+	var retriedAt sql.NullTime
+	var source sql.NullString
+
+	err := s.db.QueryRowContext(ctx, query, originalID).Scan(
+		&msg.ID,
+		&msg.EventName,
+		&msg.OriginalID,
+		&msg.Payload,
+		&metadata,
+		&msg.Error,
+		&msg.RetryCount,
+		&source,
+		&msg.CreatedAt,
+		&retriedAt,
+	)
+
+	if err == sql.ErrNoRows {
+		return nil, fmt.Errorf("original_id %s: %w", originalID, ErrNotFound)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("query: %w", err)
+	}
+
+	msg.Metadata, _ = base.UnmarshalMetadata(metadata)
+	msg.RetriedAt = base.NullTime(retriedAt)
+	msg.Source = base.NullString(source)
+
+	return &msg, nil
 }
 
 // Compile-time checks

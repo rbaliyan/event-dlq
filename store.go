@@ -153,6 +153,10 @@ type Store interface {
 	// DeleteByFilter removes messages matching the filter.
 	// Returns the number of deleted messages.
 	DeleteByFilter(ctx context.Context, filter Filter) (int64, error)
+
+	// GetByOriginalID retrieves a DLQ message by the original event message ID.
+	// Returns ErrNotFound if no message exists with that original ID.
+	GetByOriginalID(ctx context.Context, originalID string) (*Message, error)
 }
 
 // Stats provides DLQ statistics.

@@ -22,23 +22,25 @@ Uses Redis Streams and Hashes for DLQ:
 
 // RedisStore is a Redis-based DLQ store
 type RedisStore struct {
-	client       redis.Cmdable
-	streamKey    string
-	msgPrefix    string
-	eventPrefix  string
-	retriedKey   string
-	maxLen       int64
+	client         redis.Cmdable
+	streamKey      string
+	msgPrefix      string
+	eventPrefix    string
+	retriedKey     string
+	originalPrefix string
+	maxLen         int64
 }
 
 // NewRedisStore creates a new Redis DLQ store
 func NewRedisStore(client redis.Cmdable) *RedisStore {
 	return &RedisStore{
-		client:      client,
-		streamKey:   "dlq:messages",
-		msgPrefix:   "dlq:msg:",
-		eventPrefix: "dlq:by_event:",
-		retriedKey:  "dlq:retried",
-		maxLen:      0,
+		client:         client,
+		streamKey:      "dlq:messages",
+		msgPrefix:      "dlq:msg:",
+		eventPrefix:    "dlq:by_event:",
+		retriedKey:     "dlq:retried",
+		originalPrefix: "dlq:by_original:",
+		maxLen:         0,
 	}
 }
 
@@ -48,6 +50,7 @@ func (s *RedisStore) WithKeyPrefix(prefix string) *RedisStore {
 	s.msgPrefix = prefix + "msg:"
 	s.eventPrefix = prefix + "by_event:"
 	s.retriedKey = prefix + "retried"
+	s.originalPrefix = prefix + "by_original:"
 	return s
 }
 
@@ -105,6 +108,14 @@ func (s *RedisStore) Store(ctx context.Context, msg *Message) error {
 	eventKey := s.eventPrefix + msg.EventName
 	if err := s.client.SAdd(ctx, eventKey, msg.ID).Err(); err != nil {
 		return fmt.Errorf("sadd event index: %w", err)
+	}
+
+	// Add reverse-lookup index by original ID
+	if msg.OriginalID != "" {
+		originalKey := s.originalPrefix + msg.OriginalID
+		if err := s.client.Set(ctx, originalKey, msg.ID, 0).Err(); err != nil {
+			return fmt.Errorf("set original index: %w", err)
+		}
 	}
 
 	return nil
@@ -346,6 +357,11 @@ func (s *RedisStore) Delete(ctx context.Context, id string) error {
 	// Remove from retried set
 	s.client.SRem(ctx, s.retriedKey, id)
 
+	// Remove reverse-lookup index by original ID
+	if originalID := fields["original_id"]; originalID != "" {
+		s.client.Del(ctx, s.originalPrefix+originalID)
+	}
+
 	return nil
 }
 
@@ -440,6 +456,21 @@ func (s *RedisStore) Stats(ctx context.Context) (*Stats, error) {
 	}
 
 	return stats, nil
+}
+
+// GetByOriginalID retrieves a message by its original event message ID
+func (s *RedisStore) GetByOriginalID(ctx context.Context, originalID string) (*Message, error) {
+	// Look up the DLQ message ID from the reverse index
+	originalKey := s.originalPrefix + originalID
+	dlqID, err := s.client.Get(ctx, originalKey).Result()
+	if err != nil {
+		if err == redis.Nil {
+			return nil, fmt.Errorf("original_id %s: %w", originalID, ErrNotFound)
+		}
+		return nil, fmt.Errorf("get original index: %w", err)
+	}
+
+	return s.Get(ctx, dlqID)
 }
 
 // Compile-time checks

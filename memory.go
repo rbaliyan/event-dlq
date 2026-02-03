@@ -239,6 +239,21 @@ func (s *MemoryStore) Stats(ctx context.Context) (*Stats, error) {
 	return stats, nil
 }
 
+// GetByOriginalID retrieves a message by its original event message ID
+func (s *MemoryStore) GetByOriginalID(ctx context.Context, originalID string) (*Message, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	for _, msg := range s.messages {
+		if msg.OriginalID == originalID {
+			result := *msg
+			return &result, nil
+		}
+	}
+
+	return nil, fmt.Errorf("original_id %s: %w", originalID, ErrNotFound)
+}
+
 // Compile-time checks
 var _ Store = (*MemoryStore)(nil)
 var _ StatsProvider = (*MemoryStore)(nil)

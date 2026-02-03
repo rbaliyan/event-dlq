@@ -97,7 +97,9 @@ func (s *RedisStore) Store(ctx context.Context, msg *Message) error {
 
 	// Add to event index
 	eventKey := s.eventPrefix + msg.EventName
-	s.client.SAdd(ctx, eventKey, msg.ID)
+	if err := s.client.SAdd(ctx, eventKey, msg.ID).Err(); err != nil {
+		return fmt.Errorf("sadd event index: %w", err)
+	}
 
 	return nil
 }
@@ -130,20 +132,32 @@ func (s *RedisStore) parseMessage(fields map[string]string) (*Message, error) {
 	}
 
 	if metadata := fields["metadata"]; metadata != "" {
-		json.Unmarshal([]byte(metadata), &msg.Metadata)
+		if err := json.Unmarshal([]byte(metadata), &msg.Metadata); err != nil {
+			return nil, fmt.Errorf("unmarshal metadata: %w", err)
+		}
 	}
 
 	if rc := fields["retry_count"]; rc != "" {
-		msg.RetryCount, _ = strconv.Atoi(rc)
+		var err error
+		msg.RetryCount, err = strconv.Atoi(rc)
+		if err != nil {
+			return nil, fmt.Errorf("parse retry_count: %w", err)
+		}
 	}
 
 	if ts := fields["created_at"]; ts != "" {
-		unix, _ := strconv.ParseInt(ts, 10, 64)
+		unix, err := strconv.ParseInt(ts, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("parse created_at: %w", err)
+		}
 		msg.CreatedAt = time.Unix(unix, 0)
 	}
 
 	if ts := fields["retried_at"]; ts != "" {
-		unix, _ := strconv.ParseInt(ts, 10, 64)
+		unix, err := strconv.ParseInt(ts, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("parse retried_at: %w", err)
+		}
 		t := time.Unix(unix, 0)
 		msg.RetriedAt = &t
 	}
@@ -158,7 +172,11 @@ func (s *RedisStore) List(ctx context.Context, filter Filter) ([]*Message, error
 	if filter.EventName != "" {
 		// Get IDs from event index
 		eventKey := s.eventPrefix + filter.EventName
-		ids, _ = s.client.SMembers(ctx, eventKey).Result()
+		var err error
+		ids, err = s.client.SMembers(ctx, eventKey).Result()
+		if err != nil {
+			return nil, fmt.Errorf("smembers: %w", err)
+		}
 	} else {
 		// Get all IDs from stream
 		results, err := s.client.XRange(ctx, s.streamKey, "-", "+").Result()
@@ -172,19 +190,7 @@ func (s *RedisStore) List(ctx context.Context, filter Filter) ([]*Message, error
 		}
 	}
 
-	// Apply offset
-	start := filter.Offset
-	if start >= len(ids) {
-		return nil, nil
-	}
-	ids = ids[start:]
-
-	// Apply limit
-	if filter.Limit > 0 && len(ids) > filter.Limit {
-		ids = ids[:filter.Limit]
-	}
-
-	// Fetch messages
+	// Fetch and filter messages before applying offset/limit
 	var messages []*Message
 	for _, id := range ids {
 		msg, err := s.Get(ctx, id)
@@ -212,17 +218,49 @@ func (s *RedisStore) List(ctx context.Context, filter Filter) ([]*Message, error
 		messages = append(messages, msg)
 	}
 
+	// Apply offset after filtering
+	if filter.Offset > 0 {
+		if filter.Offset >= len(messages) {
+			return nil, nil
+		}
+		messages = messages[filter.Offset:]
+	}
+
+	// Apply limit after filtering
+	if filter.Limit > 0 && len(messages) > filter.Limit {
+		messages = messages[:filter.Limit]
+	}
+
 	return messages, nil
 }
 
-// Count returns the number of messages matching the filter
+// Count returns the number of messages matching the filter.
+// When only EventName (or no filter) is set, uses efficient Redis counting.
+// For complex filters, falls back to listing and counting matched messages.
 func (s *RedisStore) Count(ctx context.Context, filter Filter) (int64, error) {
-	if filter.EventName != "" {
-		eventKey := s.eventPrefix + filter.EventName
-		return s.client.SCard(ctx, eventKey).Result()
+	hasComplexFilters := filter.ExcludeRetried ||
+		!filter.StartTime.IsZero() ||
+		!filter.EndTime.IsZero() ||
+		filter.MaxRetries > 0 ||
+		filter.Source != ""
+
+	if !hasComplexFilters {
+		if filter.EventName != "" {
+			eventKey := s.eventPrefix + filter.EventName
+			return s.client.SCard(ctx, eventKey).Result()
+		}
+		return s.client.XLen(ctx, s.streamKey).Result()
 	}
 
-	return s.client.XLen(ctx, s.streamKey).Result()
+	// For complex filters, list and count all matching messages
+	countFilter := filter
+	countFilter.Offset = 0
+	countFilter.Limit = 0
+	messages, err := s.List(ctx, countFilter)
+	if err != nil {
+		return 0, err
+	}
+	return int64(len(messages)), nil
 }
 
 // MarkRetried marks a message as replayed
@@ -235,7 +273,9 @@ func (s *RedisStore) MarkRetried(ctx context.Context, id string) error {
 	}
 
 	// Add to retried set
-	s.client.SAdd(ctx, s.retriedKey, id)
+	if err := s.client.SAdd(ctx, s.retriedKey, id).Err(); err != nil {
+		return fmt.Errorf("sadd retried: %w", err)
+	}
 
 	return nil
 }
@@ -249,14 +289,20 @@ func (s *RedisStore) Delete(ctx context.Context, id string) error {
 
 	// Delete hash
 	msgKey := s.msgPrefix + id
-	s.client.Del(ctx, msgKey)
+	if err := s.client.Del(ctx, msgKey).Err(); err != nil {
+		return fmt.Errorf("del: %w", err)
+	}
 
 	// Remove from event index
 	eventKey := s.eventPrefix + msg.EventName
-	s.client.SRem(ctx, eventKey, id)
+	if err := s.client.SRem(ctx, eventKey, id).Err(); err != nil {
+		return fmt.Errorf("srem event index: %w", err)
+	}
 
 	// Remove from retried set
-	s.client.SRem(ctx, s.retriedKey, id)
+	if err := s.client.SRem(ctx, s.retriedKey, id).Err(); err != nil {
+		return fmt.Errorf("srem retried: %w", err)
+	}
 
 	return nil
 }

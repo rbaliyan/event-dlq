@@ -91,8 +91,14 @@ func (s *RedisStore) Store(ctx context.Context, msg *Message) error {
 		args.Approx = true
 	}
 
-	if err := s.client.XAdd(ctx, args).Err(); err != nil {
+	streamID, err := s.client.XAdd(ctx, args).Result()
+	if err != nil {
 		return fmt.Errorf("xadd: %w", err)
+	}
+
+	// Store stream entry ID for later deletion
+	if err := s.client.HSet(ctx, msgKey, "stream_id", streamID).Err(); err != nil {
+		return fmt.Errorf("hset stream_id: %w", err)
 	}
 
 	// Add to event index
@@ -286,6 +292,15 @@ func (s *RedisStore) Count(ctx context.Context, filter Filter) (int64, error) {
 func (s *RedisStore) MarkRetried(ctx context.Context, id string) error {
 	msgKey := s.msgPrefix + id
 
+	// Verify message exists
+	exists, err := s.client.Exists(ctx, msgKey).Result()
+	if err != nil {
+		return fmt.Errorf("exists: %w", err)
+	}
+	if exists == 0 {
+		return fmt.Errorf("%s: %w", id, ErrNotFound)
+	}
+
 	// Update retried_at
 	if err := s.client.HSet(ctx, msgKey, "retried_at", time.Now().Unix()).Err(); err != nil {
 		return fmt.Errorf("hset: %w", err)
@@ -301,27 +316,35 @@ func (s *RedisStore) MarkRetried(ctx context.Context, id string) error {
 
 // Delete removes a message from the DLQ
 func (s *RedisStore) Delete(ctx context.Context, id string) error {
-	msg, err := s.Get(ctx, id)
+	msgKey := s.msgPrefix + id
+
+	// Get message details needed for cleanup
+	fields, err := s.client.HGetAll(ctx, msgKey).Result()
 	if err != nil {
-		return err
+		return fmt.Errorf("hgetall: %w", err)
+	}
+	if len(fields) == 0 {
+		return fmt.Errorf("%s: %w", id, ErrNotFound)
 	}
 
 	// Delete hash
-	msgKey := s.msgPrefix + id
 	if err := s.client.Del(ctx, msgKey).Err(); err != nil {
 		return fmt.Errorf("del: %w", err)
 	}
 
+	// Remove from stream using stored stream entry ID
+	if streamID := fields["stream_id"]; streamID != "" {
+		s.client.XDel(ctx, s.streamKey, streamID)
+	}
+
 	// Remove from event index
-	eventKey := s.eventPrefix + msg.EventName
-	if err := s.client.SRem(ctx, eventKey, id).Err(); err != nil {
-		return fmt.Errorf("srem event index: %w", err)
+	if eventName := fields["event_name"]; eventName != "" {
+		eventKey := s.eventPrefix + eventName
+		s.client.SRem(ctx, eventKey, id)
 	}
 
 	// Remove from retried set
-	if err := s.client.SRem(ctx, s.retriedKey, id).Err(); err != nil {
-		return fmt.Errorf("srem retried: %w", err)
-	}
+	s.client.SRem(ctx, s.retriedKey, id)
 
 	return nil
 }

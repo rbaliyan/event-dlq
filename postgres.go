@@ -4,11 +4,15 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
 	"github.com/rbaliyan/event/v3/store/base"
 )
+
+// validIdentifier matches safe SQL/collection identifiers (alphanumeric and underscores).
+var validIdentifier = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
 
 /*
 PostgreSQL Schema:
@@ -45,8 +49,12 @@ func NewPostgresStore(db *sql.DB) *PostgresStore {
 	}
 }
 
-// WithTable sets a custom table name
+// WithTable sets a custom table name.
+// The name must contain only alphanumeric characters and underscores.
 func (s *PostgresStore) WithTable(table string) *PostgresStore {
+	if !validIdentifier.MatchString(table) {
+		panic(fmt.Sprintf("dlq: invalid table name %q", table))
+	}
 	s.table = table
 	return s
 }

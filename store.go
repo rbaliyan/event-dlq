@@ -63,8 +63,13 @@ package dlq
 
 import (
 	"context"
+	"errors"
 	"time"
 )
+
+// ErrNotFound is returned when a DLQ message cannot be found.
+// Use errors.Is(err, ErrNotFound) to check for this condition.
+var ErrNotFound = errors.New("dlq message not found")
 
 // Message represents a message in the dead-letter queue.
 //

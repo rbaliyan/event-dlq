@@ -295,7 +295,7 @@ func (s *MongoStore) Get(ctx context.Context, id string) (*Message, error) {
 	err := s.collection.FindOne(ctx, filter).Decode(&mongoMsg)
 	if err != nil {
 		if err == mongo.ErrNoDocuments {
-			return nil, fmt.Errorf("message not found: %s", id)
+			return nil, fmt.Errorf("%s: %w", id, ErrNotFound)
 		}
 		return nil, fmt.Errorf("find: %w", err)
 	}
@@ -396,7 +396,7 @@ func (s *MongoStore) MarkRetried(ctx context.Context, id string) error {
 	}
 
 	if result.MatchedCount == 0 {
-		return fmt.Errorf("message not found: %s", id)
+		return fmt.Errorf("%s: %w", id, ErrNotFound)
 	}
 
 	return nil
@@ -422,7 +422,7 @@ func (s *MongoStore) Delete(ctx context.Context, id string) error {
 	}
 
 	if result.DeletedCount == 0 {
-		return fmt.Errorf("message not found: %s", id)
+		return fmt.Errorf("%s: %w", id, ErrNotFound)
 	}
 
 	return nil
@@ -550,7 +550,7 @@ func (s *MongoStore) GetByOriginalID(ctx context.Context, originalID string) (*M
 	err := s.collection.FindOne(ctx, filter).Decode(&mongoMsg)
 	if err != nil {
 		if err == mongo.ErrNoDocuments {
-			return nil, fmt.Errorf("message not found with original_id: %s", originalID)
+			return nil, fmt.Errorf("original_id %s: %w", originalID, ErrNotFound)
 		}
 		return nil, fmt.Errorf("find: %w", err)
 	}
@@ -579,7 +579,7 @@ func (s *MongoStore) IncrementRetryCount(ctx context.Context, id string) error {
 	}
 
 	if result.MatchedCount == 0 {
-		return fmt.Errorf("message not found: %s", id)
+		return fmt.Errorf("%s: %w", id, ErrNotFound)
 	}
 
 	return nil

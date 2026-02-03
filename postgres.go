@@ -51,6 +51,43 @@ func (s *PostgresStore) WithTable(table string) *PostgresStore {
 	return s
 }
 
+// EnsureTable creates the DLQ table and indexes if they don't exist.
+// This is safe to call multiple times (uses IF NOT EXISTS).
+func (s *PostgresStore) EnsureTable(ctx context.Context) error {
+	query := fmt.Sprintf(`
+		CREATE TABLE IF NOT EXISTS %s (
+			id          VARCHAR(36) PRIMARY KEY,
+			event_name  VARCHAR(255) NOT NULL,
+			original_id VARCHAR(36) NOT NULL,
+			payload     BYTEA NOT NULL,
+			metadata    JSONB,
+			error       TEXT NOT NULL,
+			retry_count INT NOT NULL DEFAULT 0,
+			source      VARCHAR(255),
+			created_at  TIMESTAMP NOT NULL DEFAULT NOW(),
+			retried_at  TIMESTAMP
+		)
+	`, s.table)
+
+	if _, err := s.db.ExecContext(ctx, query); err != nil {
+		return fmt.Errorf("create table: %w", err)
+	}
+
+	indexes := []string{
+		fmt.Sprintf("CREATE INDEX IF NOT EXISTS idx_%s_event_name ON %s(event_name)", s.table, s.table),
+		fmt.Sprintf("CREATE INDEX IF NOT EXISTS idx_%s_created_at ON %s(created_at)", s.table, s.table),
+		fmt.Sprintf("CREATE INDEX IF NOT EXISTS idx_%s_retried_at ON %s(retried_at) WHERE retried_at IS NULL", s.table, s.table),
+	}
+
+	for _, idx := range indexes {
+		if _, err := s.db.ExecContext(ctx, idx); err != nil {
+			return fmt.Errorf("create index: %w", err)
+		}
+	}
+
+	return nil
+}
+
 // Store adds a message to the DLQ
 func (s *PostgresStore) Store(ctx context.Context, msg *Message) error {
 	metadata, err := base.MarshalMetadata(msg.Metadata)
@@ -109,7 +146,7 @@ func (s *PostgresStore) Get(ctx context.Context, id string) (*Message, error) {
 	)
 
 	if err == sql.ErrNoRows {
-		return nil, fmt.Errorf("message not found: %s", id)
+		return nil, fmt.Errorf("%s: %w", id, ErrNotFound)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("query: %w", err)
@@ -229,7 +266,7 @@ func (s *PostgresStore) MarkRetried(ctx context.Context, id string) error {
 
 	rows, _ := result.RowsAffected()
 	if rows == 0 {
-		return fmt.Errorf("message not found: %s", id)
+		return fmt.Errorf("%s: %w", id, ErrNotFound)
 	}
 
 	return nil
@@ -246,7 +283,7 @@ func (s *PostgresStore) Delete(ctx context.Context, id string) error {
 
 	rows, _ := result.RowsAffected()
 	if rows == 0 {
-		return fmt.Errorf("message not found: %s", id)
+		return fmt.Errorf("%s: %w", id, ErrNotFound)
 	}
 
 	return nil

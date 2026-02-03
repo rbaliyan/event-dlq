@@ -114,7 +114,7 @@ func (s *RedisStore) Get(ctx context.Context, id string) (*Message, error) {
 	}
 
 	if len(fields) == 0 {
-		return nil, fmt.Errorf("message not found: %s", id)
+		return nil, fmt.Errorf("%s: %w", id, ErrNotFound)
 	}
 
 	return s.parseMessage(fields)
@@ -190,10 +190,29 @@ func (s *RedisStore) List(ctx context.Context, filter Filter) ([]*Message, error
 		}
 	}
 
-	// Fetch and filter messages before applying offset/limit
+	// Batch-fetch all messages using pipeline to avoid N round-trips
+	if len(ids) == 0 {
+		return nil, nil
+	}
+
+	pipe := s.client.Pipeline()
+	cmds := make([]*redis.MapStringStringCmd, len(ids))
+	for i, id := range ids {
+		cmds[i] = pipe.HGetAll(ctx, s.msgPrefix+id)
+	}
+	if _, err := pipe.Exec(ctx); err != nil && err != redis.Nil {
+		return nil, fmt.Errorf("pipeline hgetall: %w", err)
+	}
+
+	// Parse results and apply filters
 	var messages []*Message
-	for _, id := range ids {
-		msg, err := s.Get(ctx, id)
+	for _, cmd := range cmds {
+		fields, err := cmd.Result()
+		if err != nil || len(fields) == 0 {
+			continue
+		}
+
+		msg, err := s.parseMessage(fields)
 		if err != nil {
 			continue
 		}

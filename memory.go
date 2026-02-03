@@ -46,7 +46,7 @@ func (s *MemoryStore) Get(ctx context.Context, id string) (*Message, error) {
 
 	msg, ok := s.messages[id]
 	if !ok {
-		return nil, fmt.Errorf("message not found: %s", id)
+		return nil, fmt.Errorf("%s: %w", id, ErrNotFound)
 	}
 
 	// Return a copy
@@ -137,7 +137,7 @@ func (s *MemoryStore) MarkRetried(ctx context.Context, id string) error {
 
 	msg, ok := s.messages[id]
 	if !ok {
-		return fmt.Errorf("message not found: %s", id)
+		return fmt.Errorf("%s: %w", id, ErrNotFound)
 	}
 
 	now := time.Now()
@@ -151,7 +151,7 @@ func (s *MemoryStore) Delete(ctx context.Context, id string) error {
 	defer s.mu.Unlock()
 
 	if _, ok := s.messages[id]; !ok {
-		return fmt.Errorf("message not found: %s", id)
+		return fmt.Errorf("%s: %w", id, ErrNotFound)
 	}
 
 	delete(s.messages, id)

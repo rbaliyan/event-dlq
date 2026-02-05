@@ -6,10 +6,9 @@ import (
 	"strings"
 	"time"
 
-	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/bson/primitive"
-	"go.mongodb.org/mongo-driver/mongo"
-	"go.mongodb.org/mongo-driver/mongo/options"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
 // isNamespaceNotFoundError checks if the error is a MongoDB namespace not found error.
@@ -362,7 +361,7 @@ func (s *MongoStore) buildFilter(filter Filter) bson.M {
 	}
 
 	if filter.Error != "" {
-		mongoFilter["error"] = primitive.Regex{Pattern: filter.Error, Options: "i"}
+		mongoFilter["error"] = bson.Regex{Pattern: filter.Error, Options: "i"}
 	}
 
 	if filter.MaxRetries > 0 {

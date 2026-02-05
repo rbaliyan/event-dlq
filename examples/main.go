@@ -24,8 +24,8 @@ import (
 	"github.com/rbaliyan/event-dlq"
 	"github.com/rbaliyan/event/v3/outbox"
 	"github.com/rbaliyan/event-mongodb"
-	"go.mongodb.org/mongo-driver/mongo"
-	"go.mongodb.org/mongo-driver/mongo/options"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
 // Order represents our business entity
@@ -48,7 +48,7 @@ func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
 	// Connect to MongoDB
-	client, err := mongo.Connect(ctx, options.Client().ApplyURI("mongodb://localhost:27017/?replicaSet=rs0"))
+	client, err := mongo.Connect(options.Client().ApplyURI("mongodb://localhost:27017/?replicaSet=rs0"))
 	if err != nil {
 		logger.Error("failed to connect to MongoDB", "error", err)
 		os.Exit(1)

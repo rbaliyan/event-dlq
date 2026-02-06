@@ -68,9 +68,9 @@ func TestMemoryStore(t *testing.T) {
 	t.Run("List with empty filter returns all", func(t *testing.T) {
 		store := NewMemoryStore()
 
-		store.Store(ctx, &Message{ID: "dlq-1", EventName: "event-1", CreatedAt: time.Now()})
-		store.Store(ctx, &Message{ID: "dlq-2", EventName: "event-2", CreatedAt: time.Now()})
-		store.Store(ctx, &Message{ID: "dlq-3", EventName: "event-3", CreatedAt: time.Now()})
+		_ = store.Store(ctx, &Message{ID: "dlq-1", EventName: "event-1", CreatedAt: time.Now()})
+		_ = store.Store(ctx, &Message{ID: "dlq-2", EventName: "event-2", CreatedAt: time.Now()})
+		_ = store.Store(ctx, &Message{ID: "dlq-3", EventName: "event-3", CreatedAt: time.Now()})
 
 		messages, err := store.List(ctx, Filter{})
 		if err != nil {
@@ -355,12 +355,12 @@ func TestMemoryStore(t *testing.T) {
 
 			go func() {
 				defer wg.Done()
-				store.List(ctx, Filter{})
+				_, _ = store.List(ctx, Filter{})
 			}()
 
 			go func() {
 				defer wg.Done()
-				store.Count(ctx, Filter{})
+				_, _ = store.Count(ctx, Filter{})
 			}()
 		}
 
@@ -437,7 +437,7 @@ func TestManager(t *testing.T) {
 		tr := &mockTransport{}
 		manager := NewManager(store, tr)
 
-		manager.Store(ctx, "event", "msg-1", []byte("data"), nil, errors.New("error"), 1, "source")
+		_ = manager.Store(ctx, "event", "msg-1", []byte("data"), nil, errors.New("error"), 1, "source")
 
 		messages, _ := store.List(ctx, Filter{})
 		msg, err := manager.Get(ctx, messages[0].ID)
@@ -455,8 +455,8 @@ func TestManager(t *testing.T) {
 		tr := &mockTransport{}
 		manager := NewManager(store, tr)
 
-		manager.Store(ctx, "event-1", "msg-1", nil, nil, errors.New("error"), 1, "source")
-		manager.Store(ctx, "event-2", "msg-2", nil, nil, errors.New("error"), 1, "source")
+		_ = manager.Store(ctx, "event-1", "msg-1", nil, nil, errors.New("error"), 1, "source")
+		_ = manager.Store(ctx, "event-2", "msg-2", nil, nil, errors.New("error"), 1, "source")
 
 		messages, err := manager.List(ctx, Filter{})
 		if err != nil {

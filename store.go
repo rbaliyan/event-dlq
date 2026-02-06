@@ -63,13 +63,24 @@ package dlq
 
 import (
 	"context"
-	"errors"
+	"fmt"
 	"time"
+
+	eventerrors "github.com/rbaliyan/event/v3/errors"
 )
 
 // ErrNotFound is returned when a DLQ message cannot be found.
 // Use errors.Is(err, ErrNotFound) to check for this condition.
-var ErrNotFound = errors.New("dlq message not found")
+//
+// This error wraps the shared event errors package error, so both
+// errors.Is(err, dlq.ErrNotFound) and errors.Is(err, eventerrors.ErrNotFound)
+// will work for error checking.
+var ErrNotFound = fmt.Errorf("dlq message %w", eventerrors.ErrNotFound)
+
+// NewNotFoundError creates a detailed not found error for a DLQ message.
+func NewNotFoundError(id string) error {
+	return eventerrors.NewNotFoundError("dlq message", id)
+}
 
 // Message represents a message in the dead-letter queue.
 //

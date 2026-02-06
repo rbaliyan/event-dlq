@@ -325,7 +325,7 @@ func (s *MongoStore) List(ctx context.Context, filter Filter) ([]*Message, error
 	if err != nil {
 		return nil, fmt.Errorf("find: %w", err)
 	}
-	defer cursor.Close(ctx)
+	defer func() { _ = cursor.Close(ctx) }()
 
 	var messages []*Message
 	for cursor.Next(ctx) {
@@ -517,7 +517,7 @@ func (s *MongoStore) Stats(ctx context.Context) (*Stats, error) {
 	if err != nil {
 		return nil, fmt.Errorf("aggregate by event: %w", err)
 	}
-	defer cursor.Close(ctx)
+	defer func() { _ = cursor.Close(ctx) }()
 
 	for cursor.Next(ctx) {
 		var result struct {

@@ -183,7 +183,7 @@ func (s *PostgresStore) List(ctx context.Context, filter Filter) ([]*Message, er
 	if err != nil {
 		return nil, fmt.Errorf("query: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var messages []*Message
 	for rows.Next() {
@@ -361,7 +361,7 @@ func (s *PostgresStore) Stats(ctx context.Context) (*Stats, error) {
 	if err != nil {
 		return nil, fmt.Errorf("count by event: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	for rows.Next() {
 		var eventName string

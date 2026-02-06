@@ -53,7 +53,7 @@ func main() {
 		logger.Error("failed to connect to MongoDB", "error", err)
 		os.Exit(1)
 	}
-	defer client.Disconnect(ctx)
+	defer func() { _ = client.Disconnect(ctx) }()
 
 	db := client.Database("myapp")
 	internalDB := client.Database("event_internal")
@@ -129,7 +129,7 @@ func main() {
 		logger.Error("failed to create bus", "error", err)
 		os.Exit(1)
 	}
-	defer bus.Close(ctx)
+	defer func() { _ = bus.Close(ctx) }()
 
 	// ============================================================
 	// STEP 6: Define Events
@@ -166,7 +166,7 @@ func main() {
 			metadata := event.ContextMetadata(ctx)
 			retryCount := 0
 			if rc, ok := metadata["retry_count"]; ok {
-				fmt.Sscanf(rc, "%d", &retryCount)
+				_, _ = fmt.Sscanf(rc, "%d", &retryCount)
 			}
 
 			if retryCount >= maxRetries {

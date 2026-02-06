@@ -1,5 +1,9 @@
 # event-dlq
 
+[![CI](https://github.com/rbaliyan/event-dlq/actions/workflows/ci.yml/badge.svg)](https://github.com/rbaliyan/event-dlq/actions/workflows/ci.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/rbaliyan/event-dlq.svg)](https://pkg.go.dev/github.com/rbaliyan/event-dlq)
+[![Go Report Card](https://goreportcard.com/badge/github.com/rbaliyan/event-dlq)](https://goreportcard.com/report/github.com/rbaliyan/event-dlq)
+
 Dead Letter Queue (DLQ) management package for the [event](https://github.com/rbaliyan/event) pub-sub library.
 
 ## Overview

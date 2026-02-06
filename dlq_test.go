@@ -121,9 +121,9 @@ func TestMemoryStore(t *testing.T) {
 		store := NewMemoryStore()
 
 		retriedAt := time.Now()
-		store.Store(ctx, &Message{ID: "dlq-1", EventName: "event", CreatedAt: time.Now()})
-		store.Store(ctx, &Message{ID: "dlq-2", EventName: "event", CreatedAt: time.Now(), RetriedAt: &retriedAt})
-		store.Store(ctx, &Message{ID: "dlq-3", EventName: "event", CreatedAt: time.Now()})
+		_ = store.Store(ctx, &Message{ID: "dlq-1", EventName: "event", CreatedAt: time.Now()})
+		_ = store.Store(ctx, &Message{ID: "dlq-2", EventName: "event", CreatedAt: time.Now(), RetriedAt: &retriedAt})
+		_ = store.Store(ctx, &Message{ID: "dlq-3", EventName: "event", CreatedAt: time.Now()})
 
 		messages, err := store.List(ctx, Filter{ExcludeRetried: true})
 		if err != nil {
@@ -139,7 +139,7 @@ func TestMemoryStore(t *testing.T) {
 		store := NewMemoryStore()
 
 		for i := 0; i < 10; i++ {
-			store.Store(ctx, &Message{ID: "dlq-" + string(rune('0'+i)), EventName: "event", CreatedAt: time.Now()})
+			_ = store.Store(ctx, &Message{ID: "dlq-" + string(rune('0'+i)), EventName: "event", CreatedAt: time.Now()})
 		}
 
 		messages, err := store.List(ctx, Filter{Limit: 3, Offset: 0})
@@ -155,9 +155,9 @@ func TestMemoryStore(t *testing.T) {
 	t.Run("Count", func(t *testing.T) {
 		store := NewMemoryStore()
 
-		store.Store(ctx, &Message{ID: "dlq-1", EventName: "order.created", CreatedAt: time.Now()})
-		store.Store(ctx, &Message{ID: "dlq-2", EventName: "order.updated", CreatedAt: time.Now()})
-		store.Store(ctx, &Message{ID: "dlq-3", EventName: "order.created", CreatedAt: time.Now()})
+		_ = store.Store(ctx, &Message{ID: "dlq-1", EventName: "order.created", CreatedAt: time.Now()})
+		_ = store.Store(ctx, &Message{ID: "dlq-2", EventName: "order.updated", CreatedAt: time.Now()})
+		_ = store.Store(ctx, &Message{ID: "dlq-3", EventName: "order.created", CreatedAt: time.Now()})
 
 		count, err := store.Count(ctx, Filter{EventName: "order.created"})
 		if err != nil {
@@ -172,7 +172,7 @@ func TestMemoryStore(t *testing.T) {
 	t.Run("MarkRetried", func(t *testing.T) {
 		store := NewMemoryStore()
 
-		store.Store(ctx, &Message{ID: "dlq-1", EventName: "event", CreatedAt: time.Now()})
+		_ = store.Store(ctx, &Message{ID: "dlq-1", EventName: "event", CreatedAt: time.Now()})
 
 		err := store.MarkRetried(ctx, "dlq-1")
 		if err != nil {
@@ -197,7 +197,7 @@ func TestMemoryStore(t *testing.T) {
 	t.Run("Delete", func(t *testing.T) {
 		store := NewMemoryStore()
 
-		store.Store(ctx, &Message{ID: "dlq-1", EventName: "event", CreatedAt: time.Now()})
+		_ = store.Store(ctx, &Message{ID: "dlq-1", EventName: "event", CreatedAt: time.Now()})
 
 		err := store.Delete(ctx, "dlq-1")
 		if err != nil {
@@ -245,9 +245,9 @@ func TestMemoryStore(t *testing.T) {
 	t.Run("DeleteByFilter", func(t *testing.T) {
 		store := NewMemoryStore()
 
-		store.Store(ctx, &Message{ID: "dlq-1", EventName: "order.created", CreatedAt: time.Now()})
-		store.Store(ctx, &Message{ID: "dlq-2", EventName: "order.updated", CreatedAt: time.Now()})
-		store.Store(ctx, &Message{ID: "dlq-3", EventName: "order.created", CreatedAt: time.Now()})
+		_ = store.Store(ctx, &Message{ID: "dlq-1", EventName: "order.created", CreatedAt: time.Now()})
+		_ = store.Store(ctx, &Message{ID: "dlq-2", EventName: "order.updated", CreatedAt: time.Now()})
+		_ = store.Store(ctx, &Message{ID: "dlq-3", EventName: "order.created", CreatedAt: time.Now()})
 
 		deleted, err := store.DeleteByFilter(ctx, Filter{EventName: "order.created"})
 		if err != nil {
@@ -263,9 +263,9 @@ func TestMemoryStore(t *testing.T) {
 		store := NewMemoryStore()
 
 		retriedAt := time.Now()
-		store.Store(ctx, &Message{ID: "dlq-1", EventName: "order.created", Error: "connection: timeout", CreatedAt: time.Now()})
-		store.Store(ctx, &Message{ID: "dlq-2", EventName: "order.updated", Error: "validation: failed", CreatedAt: time.Now(), RetriedAt: &retriedAt})
-		store.Store(ctx, &Message{ID: "dlq-3", EventName: "order.created", Error: "connection: refused", CreatedAt: time.Now()})
+		_ = store.Store(ctx, &Message{ID: "dlq-1", EventName: "order.created", Error: "connection: timeout", CreatedAt: time.Now()})
+		_ = store.Store(ctx, &Message{ID: "dlq-2", EventName: "order.updated", Error: "validation: failed", CreatedAt: time.Now(), RetriedAt: &retriedAt})
+		_ = store.Store(ctx, &Message{ID: "dlq-3", EventName: "order.created", Error: "connection: refused", CreatedAt: time.Now()})
 
 		stats, err := store.Stats(ctx)
 		if err != nil {
@@ -346,7 +346,7 @@ func TestMemoryStore(t *testing.T) {
 
 			go func(id int) {
 				defer wg.Done()
-				store.Store(ctx, &Message{
+				_ = store.Store(ctx, &Message{
 					ID:        "dlq-concurrent",
 					EventName: "event",
 					CreatedAt: time.Now(),
@@ -491,7 +491,7 @@ func TestManager(t *testing.T) {
 		tr := &mockTransport{}
 		manager := NewManager(store, tr)
 
-		store.Store(ctx, &Message{
+		_ = store.Store(ctx, &Message{
 			ID:         "dlq-1",
 			EventName:  "order.created",
 			OriginalID: "msg-123",
@@ -525,7 +525,7 @@ func TestManager(t *testing.T) {
 		tr := &mockTransport{}
 		manager := NewManager(store, tr)
 
-		store.Store(ctx, &Message{
+		_ = store.Store(ctx, &Message{
 			ID:         "dlq-1",
 			EventName:  "order.created",
 			OriginalID: "msg-123",
@@ -547,7 +547,7 @@ func TestManager(t *testing.T) {
 		tr := &mockTransport{}
 		manager := NewManager(store, tr)
 
-		store.Store(ctx, &Message{ID: "dlq-1", EventName: "event", CreatedAt: time.Now()})
+		_ = store.Store(ctx, &Message{ID: "dlq-1", EventName: "event", CreatedAt: time.Now()})
 
 		err := manager.Delete(ctx, "dlq-1")
 		if err != nil {
@@ -565,8 +565,8 @@ func TestManager(t *testing.T) {
 		tr := &mockTransport{}
 		manager := NewManager(store, tr)
 
-		store.Store(ctx, &Message{ID: "dlq-1", EventName: "order.created", CreatedAt: time.Now()})
-		store.Store(ctx, &Message{ID: "dlq-2", EventName: "order.updated", CreatedAt: time.Now()})
+		_ = store.Store(ctx, &Message{ID: "dlq-1", EventName: "order.created", CreatedAt: time.Now()})
+		_ = store.Store(ctx, &Message{ID: "dlq-2", EventName: "order.updated", CreatedAt: time.Now()})
 
 		deleted, err := manager.DeleteByFilter(ctx, Filter{EventName: "order.created"})
 		if err != nil {
@@ -584,8 +584,8 @@ func TestManager(t *testing.T) {
 		manager := NewManager(store, tr)
 
 		now := time.Now()
-		store.Store(ctx, &Message{ID: "dlq-1", EventName: "event", CreatedAt: now.Add(-2 * time.Hour)})
-		store.Store(ctx, &Message{ID: "dlq-2", EventName: "event", CreatedAt: now})
+		_ = store.Store(ctx, &Message{ID: "dlq-1", EventName: "event", CreatedAt: now.Add(-2 * time.Hour)})
+		_ = store.Store(ctx, &Message{ID: "dlq-2", EventName: "event", CreatedAt: now})
 
 		deleted, err := manager.Cleanup(ctx, 90*time.Minute)
 		if err != nil {
@@ -602,8 +602,8 @@ func TestManager(t *testing.T) {
 		tr := &mockTransport{}
 		manager := NewManager(store, tr)
 
-		store.Store(ctx, &Message{ID: "dlq-1", EventName: "event", CreatedAt: time.Now()})
-		store.Store(ctx, &Message{ID: "dlq-2", EventName: "event", CreatedAt: time.Now()})
+		_ = store.Store(ctx, &Message{ID: "dlq-1", EventName: "event", CreatedAt: time.Now()})
+		_ = store.Store(ctx, &Message{ID: "dlq-2", EventName: "event", CreatedAt: time.Now()})
 
 		stats, err := manager.Stats(ctx)
 		if err != nil {
@@ -658,25 +658,25 @@ func TestManager(t *testing.T) {
 		}
 
 		// ReplaySingle (store another message first)
-		store.Store(ctx, &Message{ID: "dlq-single", EventName: "event", OriginalID: "msg-2", CreatedAt: time.Now()})
+		_ = store.Store(ctx, &Message{ID: "dlq-single", EventName: "event", OriginalID: "msg-2", CreatedAt: time.Now()})
 		if err := manager.ReplaySingle(ctx, "dlq-single"); err != nil {
 			t.Fatalf("ReplaySingle failed: %v", err)
 		}
 
 		// Delete
-		store.Store(ctx, &Message{ID: "dlq-del", EventName: "event", CreatedAt: time.Now()})
+		_ = store.Store(ctx, &Message{ID: "dlq-del", EventName: "event", CreatedAt: time.Now()})
 		if err := manager.Delete(ctx, "dlq-del"); err != nil {
 			t.Fatalf("Delete failed: %v", err)
 		}
 
 		// DeleteByFilter
-		store.Store(ctx, &Message{ID: "dlq-bf", EventName: "event", CreatedAt: time.Now()})
+		_ = store.Store(ctx, &Message{ID: "dlq-bf", EventName: "event", CreatedAt: time.Now()})
 		if _, err := manager.DeleteByFilter(ctx, Filter{EventName: "event"}); err != nil {
 			t.Fatalf("DeleteByFilter failed: %v", err)
 		}
 
 		// Cleanup
-		store.Store(ctx, &Message{ID: "dlq-old", EventName: "event", CreatedAt: time.Now().Add(-2 * time.Hour)})
+		_ = store.Store(ctx, &Message{ID: "dlq-old", EventName: "event", CreatedAt: time.Now().Add(-2 * time.Hour)})
 		if _, err := manager.Cleanup(ctx, time.Hour); err != nil {
 			t.Fatalf("Cleanup failed: %v", err)
 		}
@@ -693,7 +693,7 @@ func TestManager(t *testing.T) {
 
 		// Store messages that will fail replay (transport fails on "fail.event")
 		for i := 0; i < 5; i++ {
-			store.Store(ctx, &Message{
+			_ = store.Store(ctx, &Message{
 				ID:         fmt.Sprintf("dlq-concurrent-%d", i),
 				EventName:  "fail.event",
 				OriginalID: fmt.Sprintf("msg-%d", i),

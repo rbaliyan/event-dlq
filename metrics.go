@@ -28,12 +28,12 @@ const (
 //   - dlq_replay_success_total: Counter of successful replays
 //   - dlq_replay_failure_total: Counter of failed replays
 type Metrics struct {
-	messagesTotal        metric.Int64Counter
+	messagesTotal         metric.Int64Counter
 	messagesReplayedTotal metric.Int64Counter
-	messagesDeletedTotal metric.Int64Counter
-	messagesPending      metric.Int64UpDownCounter
-	replaySuccessTotal   metric.Int64Counter
-	replayFailureTotal   metric.Int64Counter
+	messagesDeletedTotal  metric.Int64Counter
+	messagesPending       metric.Int64UpDownCounter
+	replaySuccessTotal    metric.Int64Counter
+	replayFailureTotal    metric.Int64Counter
 
 	// pendingCounts tracks pending messages per event for gauge updates
 	pendingMu     sync.RWMutex
@@ -110,13 +110,13 @@ func NewMetricsWithProvider(provider metric.MeterProvider) (*Metrics, error) {
 	}
 
 	return &Metrics{
-		messagesTotal:        messagesTotal,
+		messagesTotal:         messagesTotal,
 		messagesReplayedTotal: messagesReplayedTotal,
-		messagesDeletedTotal: messagesDeletedTotal,
-		messagesPending:      messagesPending,
-		replaySuccessTotal:   replaySuccessTotal,
-		replayFailureTotal:   replayFailureTotal,
-		pendingCounts:        make(map[string]int64),
+		messagesDeletedTotal:  messagesDeletedTotal,
+		messagesPending:       messagesPending,
+		replaySuccessTotal:    replaySuccessTotal,
+		replayFailureTotal:    replayFailureTotal,
+		pendingCounts:         make(map[string]int64),
 	}, nil
 }
 

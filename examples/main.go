@@ -20,10 +20,10 @@ import (
 	"syscall"
 	"time"
 
-	event "github.com/rbaliyan/event/v3"
 	"github.com/rbaliyan/event-dlq"
-	"github.com/rbaliyan/event/v3/outbox"
 	"github.com/rbaliyan/event-mongodb"
+	event "github.com/rbaliyan/event/v3"
+	"github.com/rbaliyan/event/v3/outbox"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )

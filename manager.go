@@ -8,6 +8,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/rbaliyan/event/v3/backoff"
+	"github.com/rbaliyan/event/v3/health"
 	"github.com/rbaliyan/event/v3/transport"
 	"github.com/rbaliyan/event/v3/transport/message"
 	"go.opentelemetry.io/otel/trace"
@@ -537,3 +538,64 @@ func (m *Manager) Stats(ctx context.Context) (*Stats, error) {
 		RetriedMessages: total - pending,
 	}, nil
 }
+
+// Health performs a health check on the DLQ manager.
+//
+// The health check:
+//   - Verifies store connectivity by counting messages
+//   - Returns pending and total message counts
+//
+// Returns health.StatusHealthy if the store is responsive.
+// Returns health.StatusDegraded if there are pending messages (potential backlog).
+// Returns health.StatusUnhealthy if the store is not responsive.
+func (m *Manager) Health(ctx context.Context) *health.Result {
+	start := time.Now()
+
+	// Try to count messages to verify store connectivity
+	total, err := m.store.Count(ctx, Filter{})
+	if err != nil {
+		return &health.Result{
+			Status:    health.StatusUnhealthy,
+			Message:   fmt.Sprintf("store connectivity failed: %v", err),
+			Latency:   time.Since(start),
+			CheckedAt: start,
+		}
+	}
+
+	pending, err := m.store.Count(ctx, Filter{ExcludeRetried: true})
+	if err != nil {
+		return &health.Result{
+			Status:    health.StatusDegraded,
+			Message:   fmt.Sprintf("failed to count pending: %v", err),
+			Latency:   time.Since(start),
+			CheckedAt: start,
+			Details: map[string]any{
+				"total_messages": total,
+			},
+		}
+	}
+
+	status := health.StatusHealthy
+	message := ""
+
+	// Degraded if there are pending messages (potential backlog)
+	if pending > 0 {
+		status = health.StatusDegraded
+		message = fmt.Sprintf("%d messages pending in DLQ", pending)
+	}
+
+	return &health.Result{
+		Status:    status,
+		Message:   message,
+		Latency:   time.Since(start),
+		CheckedAt: start,
+		Details: map[string]any{
+			"total_messages":   total,
+			"pending_messages": pending,
+			"retried_messages": total - pending,
+		},
+	}
+}
+
+// Compile-time check that Manager implements health.Checker
+var _ health.Checker = (*Manager)(nil)

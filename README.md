@@ -3,6 +3,9 @@
 [![CI](https://github.com/rbaliyan/event-dlq/actions/workflows/ci.yml/badge.svg)](https://github.com/rbaliyan/event-dlq/actions/workflows/ci.yml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/rbaliyan/event-dlq.svg)](https://pkg.go.dev/github.com/rbaliyan/event-dlq)
 [![Go Report Card](https://goreportcard.com/badge/github.com/rbaliyan/event-dlq)](https://goreportcard.com/report/github.com/rbaliyan/event-dlq)
+[![Release](https://img.shields.io/github/v/release/rbaliyan/event-dlq)](https://github.com/rbaliyan/event-dlq/releases/latest)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/rbaliyan/event-dlq/badge)](https://scorecard.dev/viewer/?uri=github.com/rbaliyan/event-dlq)
 
 Dead Letter Queue (DLQ) management package for the [event](https://github.com/rbaliyan/event) pub-sub library.
 

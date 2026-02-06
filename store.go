@@ -124,6 +124,114 @@ type Filter struct {
 	Offset         int       // Offset for pagination
 }
 
+// FilterBuilder provides a fluent API for constructing Filter queries.
+//
+// Example:
+//
+//	filter := dlq.NewFilterBuilder().
+//	    ForEvent("payment.process").
+//	    Since(time.Now().Add(-24 * time.Hour)).
+//	    OnlyPending().
+//	    WithLimit(100).
+//	    Build()
+type FilterBuilder struct {
+	filter Filter
+}
+
+// NewFilterBuilder creates a new filter builder.
+func NewFilterBuilder() *FilterBuilder {
+	return &FilterBuilder{}
+}
+
+// ForEvent filters by event name.
+func (b *FilterBuilder) ForEvent(name string) *FilterBuilder {
+	b.filter.EventName = name
+	return b
+}
+
+// Since filters messages created after the given time.
+func (b *FilterBuilder) Since(t time.Time) *FilterBuilder {
+	b.filter.StartTime = t
+	return b
+}
+
+// Until filters messages created before the given time.
+func (b *FilterBuilder) Until(t time.Time) *FilterBuilder {
+	b.filter.EndTime = t
+	return b
+}
+
+// InTimeRange filters messages created between start and end times.
+func (b *FilterBuilder) InTimeRange(start, end time.Time) *FilterBuilder {
+	b.filter.StartTime = start
+	b.filter.EndTime = end
+	return b
+}
+
+// Last filters messages from the last duration.
+func (b *FilterBuilder) Last(d time.Duration) *FilterBuilder {
+	b.filter.StartTime = time.Now().Add(-d)
+	return b
+}
+
+// WithErrorContaining filters by error message containing the given text.
+func (b *FilterBuilder) WithErrorContaining(text string) *FilterBuilder {
+	b.filter.Error = text
+	return b
+}
+
+// WithMaxRetries filters by messages with at most this many retries.
+func (b *FilterBuilder) WithMaxRetries(count int) *FilterBuilder {
+	b.filter.MaxRetries = count
+	return b
+}
+
+// FromSource filters by source service.
+func (b *FilterBuilder) FromSource(source string) *FilterBuilder {
+	b.filter.Source = source
+	return b
+}
+
+// OnlyPending excludes already retried messages.
+func (b *FilterBuilder) OnlyPending() *FilterBuilder {
+	b.filter.ExcludeRetried = true
+	return b
+}
+
+// IncludeRetried includes already retried messages (default).
+func (b *FilterBuilder) IncludeRetried() *FilterBuilder {
+	b.filter.ExcludeRetried = false
+	return b
+}
+
+// WithLimit sets the maximum number of results.
+func (b *FilterBuilder) WithLimit(limit int) *FilterBuilder {
+	b.filter.Limit = limit
+	return b
+}
+
+// WithOffset sets the offset for pagination.
+func (b *FilterBuilder) WithOffset(offset int) *FilterBuilder {
+	b.filter.Offset = offset
+	return b
+}
+
+// Page sets both limit and offset for pagination.
+// Page numbers are 1-indexed.
+func (b *FilterBuilder) Page(pageNum, pageSize int) *FilterBuilder {
+	if pageNum < 1 {
+		pageNum = 1
+	}
+	b.filter.Limit = pageSize
+	b.filter.Offset = (pageNum - 1) * pageSize
+	return b
+}
+
+// Build returns the constructed filter.
+func (b *FilterBuilder) Build() Filter {
+	return b.filter
+}
+
 // Store defines the interface for DLQ storage.
 //
 // Implementations must be safe for concurrent use. The store persists

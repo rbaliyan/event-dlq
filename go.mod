@@ -2,8 +2,6 @@ module github.com/rbaliyan/event-dlq
 
 go 1.24.0
 
-replace github.com/rbaliyan/event/v3 => ../event
-
 require (
 	github.com/google/uuid v1.6.0
 	github.com/rbaliyan/event-mongodb v0.1.0

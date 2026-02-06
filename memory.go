@@ -23,6 +23,13 @@ func NewMemoryStore() *MemoryStore {
 
 // Store adds a message to the DLQ
 func (s *MemoryStore) Store(ctx context.Context, msg *Message) error {
+	if msg == nil {
+		return fmt.Errorf("message is nil")
+	}
+	if msg.ID == "" {
+		return fmt.Errorf("message ID is required")
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 

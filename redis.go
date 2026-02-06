@@ -62,6 +62,13 @@ func (s *RedisStore) WithMaxLen(maxLen int64) *RedisStore {
 
 // Store adds a message to the DLQ
 func (s *RedisStore) Store(ctx context.Context, msg *Message) error {
+	if msg == nil {
+		return fmt.Errorf("message is nil")
+	}
+	if msg.ID == "" {
+		return fmt.Errorf("message ID is required")
+	}
+
 	// Store message details in hash
 	msgKey := s.msgPrefix + msg.ID
 	metadata, _ := json.Marshal(msg.Metadata)

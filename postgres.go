@@ -99,6 +99,13 @@ func (s *PostgresStore) EnsureTable(ctx context.Context) error {
 
 // Store adds a message to the DLQ
 func (s *PostgresStore) Store(ctx context.Context, msg *Message) error {
+	if msg == nil {
+		return fmt.Errorf("message is nil")
+	}
+	if msg.ID == "" {
+		return fmt.Errorf("message ID is required")
+	}
+
 	metadata, err := base.MarshalMetadata(msg.Metadata)
 	if err != nil {
 		return fmt.Errorf("marshal metadata: %w", err)

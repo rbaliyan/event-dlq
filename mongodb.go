@@ -273,6 +273,13 @@ func (s *MongoStore) CreateCapped(ctx context.Context, sizeBytes int64, maxDocs 
 
 // Store adds a message to the DLQ
 func (s *MongoStore) Store(ctx context.Context, msg *Message) error {
+	if msg == nil {
+		return fmt.Errorf("message is nil")
+	}
+	if msg.ID == "" {
+		return fmt.Errorf("message ID is required")
+	}
+
 	mongoMsg := FromMessage(msg)
 
 	_, err := s.collection.InsertOne(ctx, mongoMsg)

@@ -86,7 +86,7 @@ func TestMongoStoreIntegration(t *testing.T) {
 		db.Drop(context.Background())
 	})
 
-	store := NewMongoStore(db).WithCollection("dlq_messages")
+	store := NewMongoStore(db, WithCollection("dlq_messages"))
 	if err := store.EnsureIndexes(ctx); err != nil {
 		t.Fatalf("EnsureIndexes failed: %v", err)
 	}
@@ -106,7 +106,7 @@ func TestMongoStoreCappedIntegration(t *testing.T) {
 		db.Drop(context.Background())
 	})
 
-	store := NewMongoStore(db).WithCollection("dlq_capped")
+	store := NewMongoStore(db, WithCollection("dlq_capped"))
 
 	// Create as capped collection (1MB, 1000 docs max)
 	err := store.CreateCapped(ctx, 1024*1024, 1000)
@@ -171,7 +171,7 @@ func TestPostgresStoreIntegration(t *testing.T) {
 	// Use a unique table for this test
 	tableName := "dlq_test_" + time.Now().Format("20060102150405")
 
-	store := NewPostgresStore(db).WithTable(tableName)
+	store := NewPostgresStore(db, WithTable(tableName))
 	if err := store.EnsureTable(ctx); err != nil {
 		t.Fatalf("EnsureTable failed: %v", err)
 	}

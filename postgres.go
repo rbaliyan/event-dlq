@@ -35,28 +35,45 @@ CREATE INDEX idx_dlq_created_at ON event_dlq(created_at);
 CREATE INDEX idx_dlq_retried_at ON event_dlq(retried_at) WHERE retried_at IS NULL;
 */
 
+// PostgresStoreOption configures a PostgresStore.
+type PostgresStoreOption func(*postgresStoreOptions)
+
+type postgresStoreOptions struct {
+	table string
+}
+
+// WithTable sets a custom table name.
+// The name must contain only alphanumeric characters and underscores.
+func WithTable(table string) PostgresStoreOption {
+	return func(o *postgresStoreOptions) {
+		if table != "" {
+			if !validIdentifier.MatchString(table) {
+				panic(fmt.Sprintf("dlq: invalid table name %q", table))
+			}
+			o.table = table
+		}
+	}
+}
+
 // PostgresStore is a PostgreSQL-based DLQ store
 type PostgresStore struct {
 	db    *sql.DB
 	table string
 }
 
-// NewPostgresStore creates a new PostgreSQL DLQ store
-func NewPostgresStore(db *sql.DB) *PostgresStore {
-	return &PostgresStore{
-		db:    db,
+// NewPostgresStore creates a new PostgreSQL DLQ store.
+func NewPostgresStore(db *sql.DB, opts ...PostgresStoreOption) *PostgresStore {
+	o := &postgresStoreOptions{
 		table: "event_dlq",
 	}
-}
-
-// WithTable sets a custom table name.
-// The name must contain only alphanumeric characters and underscores.
-func (s *PostgresStore) WithTable(table string) *PostgresStore {
-	if !validIdentifier.MatchString(table) {
-		panic(fmt.Sprintf("dlq: invalid table name %q", table))
+	for _, opt := range opts {
+		opt(o)
 	}
-	s.table = table
-	return s
+
+	return &PostgresStore{
+		db:    db,
+		table: o.table,
+	}
 }
 
 // EnsureTable creates the DLQ table and indexes if they don't exist.

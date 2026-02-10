@@ -104,23 +104,40 @@ type CappedInfo struct {
 	Count    int64 // Current document count
 }
 
+// MongoStoreOption configures a MongoStore.
+type MongoStoreOption func(*mongoStoreOptions)
+
+type mongoStoreOptions struct {
+	collection string
+}
+
+// WithCollection sets a custom collection name.
+func WithCollection(name string) MongoStoreOption {
+	return func(o *mongoStoreOptions) {
+		if name != "" {
+			o.collection = name
+		}
+	}
+}
+
 // MongoStore is a MongoDB-based DLQ store
 type MongoStore struct {
 	collection *mongo.Collection
 	cappedInfo *CappedInfo // Cached capped info (nil = not checked yet)
 }
 
-// NewMongoStore creates a new MongoDB DLQ store
-func NewMongoStore(db *mongo.Database) *MongoStore {
-	return &MongoStore{
-		collection: db.Collection("event_dlq"),
+// NewMongoStore creates a new MongoDB DLQ store.
+func NewMongoStore(db *mongo.Database, opts ...MongoStoreOption) *MongoStore {
+	o := &mongoStoreOptions{
+		collection: "event_dlq",
 	}
-}
+	for _, opt := range opts {
+		opt(o)
+	}
 
-// WithCollection sets a custom collection name
-func (s *MongoStore) WithCollection(name string) *MongoStore {
-	s.collection = s.collection.Database().Collection(name)
-	return s
+	return &MongoStore{
+		collection: db.Collection(o.collection),
+	}
 }
 
 // Collection returns the underlying MongoDB collection

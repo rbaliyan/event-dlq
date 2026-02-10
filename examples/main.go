@@ -114,7 +114,7 @@ func main() {
 	// STEP 3: Setup DLQ for Failed Messages
 	// ============================================================
 
-	dlqStore := dlq.NewMongoStore(internalDB).WithCollection("_dlq")
+	dlqStore := dlq.NewMongoStore(internalDB, dlq.WithCollection("_dlq"))
 	dlqManager := dlq.NewManager(dlqStore, transport, dlq.WithLogger(logger))
 
 	// ============================================================

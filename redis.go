@@ -31,33 +31,50 @@ type RedisStore struct {
 	maxLen         int64
 }
 
-// NewRedisStore creates a new Redis DLQ store
-func NewRedisStore(client redis.Cmdable) *RedisStore {
-	return &RedisStore{
-		client:         client,
-		streamKey:      "dlq:messages",
-		msgPrefix:      "dlq:msg:",
-		eventPrefix:    "dlq:by_event:",
-		retriedKey:     "dlq:retried",
-		originalPrefix: "dlq:by_original:",
-		maxLen:         0,
+// RedisStoreOption configures a RedisStore.
+type RedisStoreOption func(*redisStoreOptions)
+
+type redisStoreOptions struct {
+	keyPrefix string
+	maxLen    int64
+}
+
+// WithKeyPrefix sets a custom key prefix for all Redis keys.
+func WithKeyPrefix(prefix string) RedisStoreOption {
+	return func(o *redisStoreOptions) {
+		if prefix != "" {
+			o.keyPrefix = prefix
+		}
 	}
 }
 
-// WithKeyPrefix sets a custom key prefix
-func (s *RedisStore) WithKeyPrefix(prefix string) *RedisStore {
-	s.streamKey = prefix + "messages"
-	s.msgPrefix = prefix + "msg:"
-	s.eventPrefix = prefix + "by_event:"
-	s.retriedKey = prefix + "retried"
-	s.originalPrefix = prefix + "by_original:"
-	return s
+// WithMaxLen sets the maximum stream length.
+func WithMaxLen(maxLen int64) RedisStoreOption {
+	return func(o *redisStoreOptions) {
+		if maxLen > 0 {
+			o.maxLen = maxLen
+		}
+	}
 }
 
-// WithMaxLen sets the maximum stream length
-func (s *RedisStore) WithMaxLen(maxLen int64) *RedisStore {
-	s.maxLen = maxLen
-	return s
+// NewRedisStore creates a new Redis DLQ store.
+func NewRedisStore(client redis.Cmdable, opts ...RedisStoreOption) *RedisStore {
+	o := &redisStoreOptions{
+		keyPrefix: "dlq:",
+	}
+	for _, opt := range opts {
+		opt(o)
+	}
+
+	return &RedisStore{
+		client:         client,
+		streamKey:      o.keyPrefix + "messages",
+		msgPrefix:      o.keyPrefix + "msg:",
+		eventPrefix:    o.keyPrefix + "by_event:",
+		retriedKey:     o.keyPrefix + "retried",
+		originalPrefix: o.keyPrefix + "by_original:",
+		maxLen:         o.maxLen,
+	}
 }
 
 // Store adds a message to the DLQ

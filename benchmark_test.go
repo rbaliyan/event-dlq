@@ -143,7 +143,7 @@ func BenchmarkManagerStore(b *testing.B) {
 	ctx := context.Background()
 	store := NewMemoryStore()
 	tr := &benchTransport{}
-	manager := NewManager(store, tr)
+	manager := NewManagerWithTransport(store, tr)
 	payload := []byte(`{"order_id": "12345"}`)
 	err := errors.New("processing failed")
 

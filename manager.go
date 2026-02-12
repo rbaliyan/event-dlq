@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	event "github.com/rbaliyan/event/v3"
 	"github.com/rbaliyan/event/v3/backoff"
 	"github.com/rbaliyan/event/v3/health"
 	"github.com/rbaliyan/event/v3/transport"
@@ -39,14 +40,9 @@ import (
 //	// Get statistics
 //	stats, _ := manager.Stats(ctx)
 //	fmt.Printf("Pending: %d\n", stats.PendingMessages)
-// Republisher defines the interface for replaying messages. Both transport.Transport
-// (via Publish) and *event.Bus (via Send) can serve as republishers.
-// Using a Bus is recommended for transports that don't support Publish (e.g., MongoDB
-// Change Streams), as Bus.Send() routes through the transport layer correctly.
-type Republisher interface {
-	// Send publishes a message to the specified event name.
-	Send(ctx context.Context, eventName string, eventID string, payload []byte, metadata map[string]string) error
-}
+// Republisher sends events for DLQ replay.
+// This is an alias for event.Sender.
+type Republisher = event.Sender
 
 // transportRepublisher wraps transport.Transport to satisfy Republisher.
 type transportRepublisher struct {

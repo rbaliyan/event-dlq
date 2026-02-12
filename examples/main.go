@@ -110,15 +110,18 @@ func main() {
 	}
 
 	// ============================================================
-	// STEP 3: Setup DLQ for Failed Messages
+	// STEP 3: Setup DLQ Store
 	// ============================================================
 
+	dlqStore := dlq.NewMongoStore(internalDB, dlq.WithCollection("_dlq"))
+
 	// ============================================================
-	// STEP 3: Create Event Bus
+	// STEP 4: Create Event Bus with DLQ
 	// ============================================================
 
 	bus, err := event.NewBus("orders",
 		event.WithTransport(transport),
+		event.WithDLQ(dlq.NewStoreAdapter(dlqStore, "order-service")),
 		event.WithLogger(logger),
 	)
 	if err != nil {
@@ -127,19 +130,15 @@ func main() {
 	}
 	defer func() { _ = bus.Close(ctx) }()
 
-	// ============================================================
-	// STEP 4: Setup DLQ for Failed Messages (using bus for replay)
-	// ============================================================
-
-	dlqStore := dlq.NewMongoStore(internalDB, dlq.WithCollection("_dlq"))
+	// DLQ manager is still used for replay, stats, and cleanup
 	dlqManager := dlq.NewManager(dlqStore, bus, dlq.WithLogger(logger))
 
 	// ============================================================
-	// STEP 6: Define Events
+	// STEP 5: Define Events
 	// ============================================================
 
-	orderCreated := event.New[Order]("order.created")
-	orderUpdated := event.New[Order]("order.updated")
+	orderCreated := event.New[Order]("order.created", event.WithMaxRetries(3))
+	orderUpdated := event.New[Order]("order.updated", event.WithMaxRetries(3))
 
 	// Register events with bus
 	if err := event.Register(ctx, bus, orderCreated); err != nil {
@@ -152,57 +151,23 @@ func main() {
 	}
 
 	// ============================================================
-	// STEP 7: Subscribe with At-Least-Once Handler
+	// STEP 6: Subscribe with At-Least-Once Handler
 	// ============================================================
 
-	// Handler with DLQ integration for permanent failures
-	maxRetries := 3
+	// Handler is simple — the bus auto-routes rejected messages to DLQ
+	// after max retries (configured via event.WithMaxRetries above).
 	handler := func(ctx context.Context, e event.Event[Order], order Order) error {
 		logger.Info("processing order",
 			"order_id", order.ID,
 			"customer", order.Customer,
 			"amount", order.Amount)
 
-		// Simulate processing that might fail
 		if err := processOrder(ctx, order); err != nil {
-			// Get retry count from metadata
-			metadata := event.ContextMetadata(ctx)
-			retryCount := 0
-			if rc, ok := metadata["retry_count"]; ok {
-				_, _ = fmt.Sscanf(rc, "%d", &retryCount)
-			}
-
-			if retryCount >= maxRetries {
-				// Send to DLQ after max retries
-				logger.Warn("sending to DLQ after max retries",
-					"order_id", order.ID,
-					"retries", retryCount,
-					"error", err)
-
-				// Get payload for DLQ (would need to serialize order)
-				payload := []byte(fmt.Sprintf(`{"id":"%s","customer":"%s"}`, order.ID, order.Customer))
-
-				dlqErr := dlqManager.Store(ctx,
-					e.Name(),
-					event.ContextEventID(ctx),
-					payload,
-					metadata,
-					err,
-					retryCount,
-					"order-service",
-				)
-				if dlqErr != nil {
-					logger.Error("failed to store in DLQ", "error", dlqErr)
-					return err // Return original error to nack
-				}
-				return nil // Message safely in DLQ, ack it
-			}
-
-			return err // Return error to trigger nack and redelivery
+			return err // Bus handles retry + DLQ routing automatically
 		}
 
 		logger.Info("order processed successfully", "order_id", order.ID)
-		return nil // Success - ack the message
+		return nil
 	}
 
 	// Subscribe with worker group for competing consumers (load balancing)
@@ -222,7 +187,7 @@ func main() {
 	}
 
 	// ============================================================
-	// STEP 8: Setup Outbox Relay (Background Publisher)
+	// STEP 7: Setup Outbox Relay (Background Publisher)
 	// ============================================================
 
 	relay := outbox.NewMongoRelay(outboxStore, transport).
@@ -239,7 +204,7 @@ func main() {
 	}()
 
 	// ============================================================
-	// STEP 9: Background DLQ Maintenance
+	// STEP 8: Background DLQ Maintenance
 	// ============================================================
 
 	go func() {
@@ -272,7 +237,7 @@ func main() {
 	}()
 
 	// ============================================================
-	// STEP 10: Example Publisher with Transactional Outbox
+	// STEP 9: Example Publisher with Transactional Outbox
 	// ============================================================
 
 	// Demonstrate publishing with outbox pattern

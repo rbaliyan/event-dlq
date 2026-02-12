@@ -66,8 +66,7 @@ func main() {
 	// event are written in the same transaction. If the transaction
 	// fails, neither is persisted.
 
-	outboxStore := outbox.NewMongoStore(internalDB).
-		WithCollection("_outbox")
+	outboxStore := outbox.NewMongoStore(internalDB, outbox.WithCollection("_outbox"))
 
 	// Create indexes for efficient querying
 	if err := outboxStore.EnsureIndexes(ctx); err != nil {
@@ -114,11 +113,8 @@ func main() {
 	// STEP 3: Setup DLQ for Failed Messages
 	// ============================================================
 
-	dlqStore := dlq.NewMongoStore(internalDB, dlq.WithCollection("_dlq"))
-	dlqManager := dlq.NewManager(dlqStore, transport, dlq.WithLogger(logger))
-
 	// ============================================================
-	// STEP 4: Create Event Bus
+	// STEP 3: Create Event Bus
 	// ============================================================
 
 	bus, err := event.NewBus("orders",
@@ -130,6 +126,13 @@ func main() {
 		os.Exit(1)
 	}
 	defer func() { _ = bus.Close(ctx) }()
+
+	// ============================================================
+	// STEP 4: Setup DLQ for Failed Messages (using bus for replay)
+	// ============================================================
+
+	dlqStore := dlq.NewMongoStore(internalDB, dlq.WithCollection("_dlq"))
+	dlqManager := dlq.NewManager(dlqStore, bus, dlq.WithLogger(logger))
 
 	// ============================================================
 	// STEP 6: Define Events

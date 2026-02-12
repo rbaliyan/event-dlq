@@ -11,7 +11,6 @@ import (
 	"github.com/rbaliyan/event/v3/health"
 	"github.com/rbaliyan/event/v3/transport"
 	"github.com/rbaliyan/event/v3/transport/message"
-	"go.opentelemetry.io/otel/trace"
 )
 
 // Manager handles DLQ operations including replay.
@@ -40,13 +39,32 @@ import (
 //	// Get statistics
 //	stats, _ := manager.Stats(ctx)
 //	fmt.Printf("Pending: %d\n", stats.PendingMessages)
+// Republisher defines the interface for replaying messages. Both transport.Transport
+// (via Publish) and *event.Bus (via Send) can serve as republishers.
+// Using a Bus is recommended for transports that don't support Publish (e.g., MongoDB
+// Change Streams), as Bus.Send() routes through the transport layer correctly.
+type Republisher interface {
+	// Send publishes a message to the specified event name.
+	Send(ctx context.Context, eventName string, eventID string, payload []byte, metadata map[string]string) error
+}
+
+// transportRepublisher wraps transport.Transport to satisfy Republisher.
+type transportRepublisher struct {
+	t transport.Transport
+}
+
+func (r *transportRepublisher) Send(ctx context.Context, eventName string, eventID string, payload []byte, metadata map[string]string) error {
+	msg := message.New(eventID, "dlq-replay", payload, metadata)
+	return r.t.Publish(ctx, eventName, msg)
+}
+
 type Manager struct {
-	store      Store
-	transport  transport.Transport
-	logger     *slog.Logger
-	metrics    *Metrics
-	backoff    BackoffStrategy
-	maxRetries int
+	store       Store
+	republisher Republisher
+	logger      *slog.Logger
+	metrics     *Metrics
+	backoff     BackoffStrategy
+	maxRetries  int
 }
 
 // BackoffStrategy is an alias for backoff.Strategy from the main event library.
@@ -176,27 +194,32 @@ func WithMaxRetries(max int) ManagerOption {
 
 // NewManager creates a new DLQ manager.
 //
-// The manager requires a store for persistence and a transport for replaying
-// messages back to their original events.
+// The manager requires a store for persistence and a republisher for replaying
+// messages back to their original events. The republisher can be:
+//   - An *event.Bus (recommended — works with all transports including MongoDB)
+//   - A transport.Transport (wrapped automatically via NewManagerWithTransport)
+//   - Any custom Republisher implementation
 //
 // Parameters:
 //   - store: DLQ storage implementation
-//   - t: Transport for publishing replayed messages
+//   - r: Republisher for replaying messages (typically *event.Bus)
 //   - opts: Optional configuration (logger, metrics, backoff, etc.)
 //
 // Example:
 //
 //	store := dlq.NewRedisStore(redisClient)
-//	manager := dlq.NewManager(store, transport)
+//
+//	// Using a bus (recommended for MongoDB and other non-publishable transports)
+//	manager := dlq.NewManager(store, bus)
 //
 //	// With metrics and retry backoff
 //	metrics, _ := dlq.NewMetrics()
-//	manager := dlq.NewManager(store, transport,
+//	manager := dlq.NewManager(store, bus,
 //	    dlq.WithMetrics(metrics),
 //	    dlq.WithBackoff(backoffStrategy),
 //	    dlq.WithMaxRetries(3),
 //	)
-func NewManager(store Store, t transport.Transport, opts ...ManagerOption) *Manager {
+func NewManager(store Store, r Republisher, opts ...ManagerOption) *Manager {
 	o := &managerOptions{
 		logger: slog.Default().With("component", "dlq.manager"),
 	}
@@ -205,13 +228,20 @@ func NewManager(store Store, t transport.Transport, opts ...ManagerOption) *Mana
 	}
 
 	return &Manager{
-		store:      store,
-		transport:  t,
-		logger:     o.logger,
-		metrics:    o.metrics,
-		backoff:    o.backoff,
-		maxRetries: o.maxRetries,
+		store:       store,
+		republisher: r,
+		logger:      o.logger,
+		metrics:     o.metrics,
+		backoff:     o.backoff,
+		maxRetries:  o.maxRetries,
 	}
+}
+
+// NewManagerWithTransport creates a DLQ manager using a transport for replay.
+// This wraps the transport in a Republisher adapter. For transports that don't
+// support Publish (e.g., MongoDB), use NewManager with a *event.Bus instead.
+func NewManagerWithTransport(store Store, t transport.Transport, opts ...ManagerOption) *Manager {
+	return NewManager(store, &transportRepublisher{t: t}, opts...)
 }
 
 // Store adds a failed message to the DLQ.
@@ -449,22 +479,7 @@ func (m *Manager) replayMessage(ctx context.Context, msg *Message) error {
 	metadata["dlq_message_id"] = msg.ID
 	metadata["dlq_original_error"] = msg.Error
 
-	// Propagate trace context from the current span
-	var opts []message.Option
-	if sc := trace.SpanContextFromContext(ctx); sc.IsValid() {
-		opts = append(opts, message.WithSpanContext(sc))
-	}
-
-	// Create transport message
-	transportMsg := message.New(
-		msg.OriginalID,
-		"dlq-replay",
-		msg.Payload, // Send raw payload
-		metadata,
-		opts...,
-	)
-
-	return m.transport.Publish(ctx, msg.EventName, transportMsg)
+	return m.republisher.Send(ctx, msg.EventName, msg.OriginalID, msg.Payload, metadata)
 }
 
 // Delete removes a message from the DLQ

@@ -47,9 +47,6 @@ type postgresStoreOptions struct {
 func WithTable(table string) PostgresStoreOption {
 	return func(o *postgresStoreOptions) {
 		if table != "" {
-			if !validIdentifier.MatchString(table) {
-				panic(fmt.Sprintf("dlq: invalid table name %q", table))
-			}
 			o.table = table
 		}
 	}
@@ -62,7 +59,12 @@ type PostgresStore struct {
 }
 
 // NewPostgresStore creates a new PostgreSQL DLQ store.
-func NewPostgresStore(db *sql.DB, opts ...PostgresStoreOption) *PostgresStore {
+// Returns an error if db is nil or table name is invalid.
+func NewPostgresStore(db *sql.DB, opts ...PostgresStoreOption) (*PostgresStore, error) {
+	if db == nil {
+		return nil, fmt.Errorf("dlq: db must not be nil")
+	}
+
 	o := &postgresStoreOptions{
 		table: "event_dlq",
 	}
@@ -70,10 +72,14 @@ func NewPostgresStore(db *sql.DB, opts ...PostgresStoreOption) *PostgresStore {
 		opt(o)
 	}
 
+	if !validIdentifier.MatchString(o.table) {
+		return nil, fmt.Errorf("dlq: invalid table name %q", o.table)
+	}
+
 	return &PostgresStore{
 		db:    db,
 		table: o.table,
-	}
+	}, nil
 }
 
 // EnsureTable creates the DLQ table and indexes if they don't exist.

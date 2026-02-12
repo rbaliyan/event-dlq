@@ -171,7 +171,10 @@ func TestPostgresStoreIntegration(t *testing.T) {
 	// Use a unique table for this test
 	tableName := "dlq_test_" + time.Now().Format("20060102150405")
 
-	store := NewPostgresStore(db, WithTable(tableName))
+	store, err := NewPostgresStore(db, WithTable(tableName))
+	if err != nil {
+		t.Fatalf("NewPostgresStore failed: %v", err)
+	}
 	if err := store.EnsureTable(ctx); err != nil {
 		t.Fatalf("EnsureTable failed: %v", err)
 	}

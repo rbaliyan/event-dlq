@@ -86,7 +86,10 @@ func TestMongoStoreIntegration(t *testing.T) {
 		db.Drop(context.Background())
 	})
 
-	store := NewMongoStore(db, WithCollection("dlq_messages"))
+	store, err := NewMongoStore(db, WithCollection("dlq_messages"))
+	if err != nil {
+		t.Fatalf("NewMongoStore failed: %v", err)
+	}
 	if err := store.EnsureIndexes(ctx); err != nil {
 		t.Fatalf("EnsureIndexes failed: %v", err)
 	}
@@ -106,10 +109,13 @@ func TestMongoStoreCappedIntegration(t *testing.T) {
 		db.Drop(context.Background())
 	})
 
-	store := NewMongoStore(db, WithCollection("dlq_capped"))
+	store, err := NewMongoStore(db, WithCollection("dlq_capped"))
+	if err != nil {
+		t.Fatalf("NewMongoStore failed: %v", err)
+	}
 
 	// Create as capped collection (1MB, 1000 docs max)
-	err := store.CreateCapped(ctx, 1024*1024, 1000)
+	err = store.CreateCapped(ctx, 1024*1024, 1000)
 	if err != nil {
 		t.Fatalf("CreateCapped failed: %v", err)
 	}

@@ -238,6 +238,10 @@ func (s *PostgresStore) List(ctx context.Context, filter Filter) ([]*Message, er
 		messages = append(messages, &msg)
 	}
 
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows iteration: %w", err)
+	}
+
 	return messages, nil
 }
 
@@ -393,6 +397,10 @@ func (s *PostgresStore) Stats(ctx context.Context) (*Stats, error) {
 			return nil, fmt.Errorf("scan: %w", err)
 		}
 		stats.MessagesByEvent[eventName] = count
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows iteration: %w", err)
 	}
 
 	// Oldest and newest

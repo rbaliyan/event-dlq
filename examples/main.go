@@ -113,7 +113,11 @@ func main() {
 	// STEP 3: Setup DLQ Store
 	// ============================================================
 
-	dlqStore := dlq.NewMongoStore(internalDB, dlq.WithCollection("_dlq"))
+	dlqStore, err := dlq.NewMongoStore(internalDB, dlq.WithCollection("_dlq"))
+	if err != nil {
+		slog.Error("failed to create DLQ store", "error", err)
+		os.Exit(1)
+	}
 
 	// ============================================================
 	// STEP 4: Create Event Bus with DLQ

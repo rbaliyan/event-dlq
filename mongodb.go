@@ -51,8 +51,8 @@ db.event_dlq.createIndex({ "retried_at": 1 }, { sparse: true })
 db.event_dlq.createIndex({ "event_name": 1, "created_at": 1 })
 */
 
-// MongoMessage represents a DLQ message document in MongoDB
-type MongoMessage struct {
+// mongoMessage represents a DLQ message document in MongoDB
+type mongoMessage struct {
 	ID         string            `bson:"_id"`
 	EventName  string            `bson:"event_name"`
 	OriginalID string            `bson:"original_id"`
@@ -65,8 +65,8 @@ type MongoMessage struct {
 	RetriedAt  *time.Time        `bson:"retried_at,omitempty"`
 }
 
-// ToMessage converts MongoMessage to Message
-func (m *MongoMessage) ToMessage() *Message {
+// toMessage converts mongoMessage to Message
+func (m *mongoMessage) toMessage() *Message {
 	return &Message{
 		ID:         m.ID,
 		EventName:  m.EventName,
@@ -81,9 +81,9 @@ func (m *MongoMessage) ToMessage() *Message {
 	}
 }
 
-// FromMessage creates a MongoMessage from Message
-func FromMessage(m *Message) *MongoMessage {
-	return &MongoMessage{
+// fromMessage creates a mongoMessage from Message
+func fromMessage(m *Message) *mongoMessage {
+	return &mongoMessage{
 		ID:         m.ID,
 		EventName:  m.EventName,
 		OriginalID: m.OriginalID,
@@ -97,8 +97,8 @@ func FromMessage(m *Message) *MongoMessage {
 	}
 }
 
-// CappedInfo contains information about a capped collection
-type CappedInfo struct {
+// cappedInfo contains information about a capped collection
+type cappedInfo struct {
 	Capped   bool  // Whether the collection is capped
 	Size     int64 // Maximum size in bytes
 	MaxDocs  int64 // Maximum number of documents (0 = unlimited)
@@ -126,7 +126,7 @@ func WithCollection(name string) MongoStoreOption {
 type MongoStore struct {
 	collection *mongo.Collection
 	cappedOnce sync.Once   // Ensures cappedInfo is fetched only once
-	cappedInfo *CappedInfo // Cached capped info (nil = not checked yet)
+	cappedInfo *cappedInfo // Cached capped info (nil = not checked yet)
 	cappedErr  error       // Error from first cappedInfo fetch
 }
 
@@ -191,30 +191,30 @@ func (s *MongoStore) EnsureIndexes(ctx context.Context) error {
 // IsCapped returns whether the collection is a capped collection.
 // The result is cached after the first call.
 func (s *MongoStore) IsCapped(ctx context.Context) (bool, error) {
-	info, err := s.GetCappedInfo(ctx)
+	info, err := s.getCappedInfo(ctx)
 	if err != nil {
 		return false, err
 	}
 	return info.Capped, nil
 }
 
-// GetCappedInfo returns detailed information about the collection's capped status.
+// getCappedInfo returns detailed information about the collection's capped status.
 // The result is cached after the first call. Thread-safe.
-func (s *MongoStore) GetCappedInfo(ctx context.Context) (*CappedInfo, error) {
+func (s *MongoStore) getCappedInfo(ctx context.Context) (*cappedInfo, error) {
 	s.cappedOnce.Do(func() {
 		s.cappedInfo, s.cappedErr = s.fetchCappedInfo(ctx)
 	})
 	return s.cappedInfo, s.cappedErr
 }
 
-// RefreshCappedInfo forces a refresh of the cached capped collection info.
-func (s *MongoStore) RefreshCappedInfo(ctx context.Context) (*CappedInfo, error) {
+// refreshCappedInfo forces a refresh of the cached capped collection info.
+func (s *MongoStore) refreshCappedInfo(ctx context.Context) (*cappedInfo, error) {
 	s.cappedOnce = sync.Once{} // Reset for re-fetch
-	return s.GetCappedInfo(ctx)
+	return s.getCappedInfo(ctx)
 }
 
 // fetchCappedInfo queries MongoDB for collection stats to determine if capped.
-func (s *MongoStore) fetchCappedInfo(ctx context.Context) (*CappedInfo, error) {
+func (s *MongoStore) fetchCappedInfo(ctx context.Context) (*cappedInfo, error) {
 	var result bson.M
 	err := s.collection.Database().RunCommand(ctx, bson.D{
 		{Key: "collStats", Value: s.collection.Name()},
@@ -224,12 +224,12 @@ func (s *MongoStore) fetchCappedInfo(ctx context.Context) (*CappedInfo, error) {
 		// Collection might not exist yet - treat as non-capped
 		// MongoDB returns "ns not found" or similar for missing collections
 		if isNamespaceNotFoundError(err) {
-			return &CappedInfo{Capped: false}, nil
+			return &cappedInfo{Capped: false}, nil
 		}
 		return nil, fmt.Errorf("collStats: %w", err)
 	}
 
-	info := &CappedInfo{}
+	info := &cappedInfo{}
 
 	if capped, ok := result["capped"].(bool); ok {
 		info.Capped = capped
@@ -299,7 +299,7 @@ func (s *MongoStore) Store(ctx context.Context, msg *Message) error {
 		return fmt.Errorf("message ID is required")
 	}
 
-	mongoMsg := FromMessage(msg)
+	mongoMsg := fromMessage(msg)
 
 	_, err := s.collection.InsertOne(ctx, mongoMsg)
 	if err != nil {
@@ -316,7 +316,7 @@ func (s *MongoStore) Store(ctx context.Context, msg *Message) error {
 func (s *MongoStore) Get(ctx context.Context, id string) (*Message, error) {
 	filter := bson.M{"_id": id}
 
-	var mongoMsg MongoMessage
+	var mongoMsg mongoMessage
 	err := s.collection.FindOne(ctx, filter).Decode(&mongoMsg)
 	if err != nil {
 		if errors.Is(err, mongo.ErrNoDocuments) {
@@ -325,7 +325,7 @@ func (s *MongoStore) Get(ctx context.Context, id string) (*Message, error) {
 		return nil, fmt.Errorf("find: %w", err)
 	}
 
-	return mongoMsg.ToMessage(), nil
+	return mongoMsg.toMessage(), nil
 }
 
 // List returns messages matching the filter
@@ -348,11 +348,11 @@ func (s *MongoStore) List(ctx context.Context, filter Filter) ([]*Message, error
 
 	var messages []*Message
 	for cursor.Next(ctx) {
-		var mongoMsg MongoMessage
+		var mongoMsg mongoMessage
 		if err := cursor.Decode(&mongoMsg); err != nil {
 			return nil, fmt.Errorf("decode: %w", err)
 		}
-		messages = append(messages, mongoMsg.ToMessage())
+		messages = append(messages, mongoMsg.toMessage())
 	}
 
 	return messages, cursor.Err()
@@ -548,14 +548,14 @@ func (s *MongoStore) Stats(ctx context.Context) (*Stats, error) {
 
 	// Find oldest and newest
 	oldestOpts := options.FindOne().SetSort(bson.D{{Key: "created_at", Value: 1}})
-	var oldest MongoMessage
+	var oldest mongoMessage
 	err = s.collection.FindOne(ctx, bson.M{}, oldestOpts).Decode(&oldest)
 	if err == nil {
 		stats.OldestMessage = &oldest.CreatedAt
 	}
 
 	newestOpts := options.FindOne().SetSort(bson.D{{Key: "created_at", Value: -1}})
-	var newest MongoMessage
+	var newest mongoMessage
 	err = s.collection.FindOne(ctx, bson.M{}, newestOpts).Decode(&newest)
 	if err == nil {
 		stats.NewestMessage = &newest.CreatedAt
@@ -568,7 +568,7 @@ func (s *MongoStore) Stats(ctx context.Context) (*Stats, error) {
 func (s *MongoStore) GetByOriginalID(ctx context.Context, originalID string) (*Message, error) {
 	filter := bson.M{"original_id": originalID}
 
-	var mongoMsg MongoMessage
+	var mongoMsg mongoMessage
 	err := s.collection.FindOne(ctx, filter).Decode(&mongoMsg)
 	if err != nil {
 		if errors.Is(err, mongo.ErrNoDocuments) {
@@ -577,7 +577,7 @@ func (s *MongoStore) GetByOriginalID(ctx context.Context, originalID string) (*M
 		return nil, fmt.Errorf("find: %w", err)
 	}
 
-	return mongoMsg.ToMessage(), nil
+	return mongoMsg.toMessage(), nil
 }
 
 // GetByEventName retrieves all messages for a specific event

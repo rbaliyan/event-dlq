@@ -198,12 +198,6 @@ func (b *FilterBuilder) OnlyPending() *FilterBuilder {
 	return b
 }
 
-// IncludeRetried includes already retried messages (default).
-func (b *FilterBuilder) IncludeRetried() *FilterBuilder {
-	b.filter.ExcludeRetried = false
-	return b
-}
-
 // WithLimit sets the maximum number of results.
 func (b *FilterBuilder) WithLimit(limit int) *FilterBuilder {
 	b.filter.Limit = limit

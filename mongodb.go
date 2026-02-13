@@ -207,12 +207,6 @@ func (s *MongoStore) getCappedInfo(ctx context.Context) (*cappedInfo, error) {
 	return s.cappedInfo, s.cappedErr
 }
 
-// refreshCappedInfo forces a refresh of the cached capped collection info.
-func (s *MongoStore) refreshCappedInfo(ctx context.Context) (*cappedInfo, error) {
-	s.cappedOnce = sync.Once{} // Reset for re-fetch
-	return s.getCappedInfo(ctx)
-}
-
 // fetchCappedInfo queries MongoDB for collection stats to determine if capped.
 func (s *MongoStore) fetchCappedInfo(ctx context.Context) (*cappedInfo, error) {
 	var result bson.M

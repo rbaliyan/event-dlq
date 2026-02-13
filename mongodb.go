@@ -2,8 +2,10 @@ package dlq
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -123,11 +125,18 @@ func WithCollection(name string) MongoStoreOption {
 // MongoStore is a MongoDB-based DLQ store
 type MongoStore struct {
 	collection *mongo.Collection
+	cappedOnce sync.Once   // Ensures cappedInfo is fetched only once
 	cappedInfo *CappedInfo // Cached capped info (nil = not checked yet)
+	cappedErr  error       // Error from first cappedInfo fetch
 }
 
 // NewMongoStore creates a new MongoDB DLQ store.
-func NewMongoStore(db *mongo.Database, opts ...MongoStoreOption) *MongoStore {
+// Returns an error if db is nil.
+func NewMongoStore(db *mongo.Database, opts ...MongoStoreOption) (*MongoStore, error) {
+	if db == nil {
+		return nil, fmt.Errorf("dlq: db must not be nil")
+	}
+
 	o := &mongoStoreOptions{
 		collection: "event_dlq",
 	}
@@ -137,7 +146,7 @@ func NewMongoStore(db *mongo.Database, opts ...MongoStoreOption) *MongoStore {
 
 	return &MongoStore{
 		collection: db.Collection(o.collection),
-	}
+	}, nil
 }
 
 // Collection returns the underlying MongoDB collection
@@ -190,24 +199,17 @@ func (s *MongoStore) IsCapped(ctx context.Context) (bool, error) {
 }
 
 // GetCappedInfo returns detailed information about the collection's capped status.
-// The result is cached after the first call.
+// The result is cached after the first call. Thread-safe.
 func (s *MongoStore) GetCappedInfo(ctx context.Context) (*CappedInfo, error) {
-	if s.cappedInfo != nil {
-		return s.cappedInfo, nil
-	}
-
-	info, err := s.fetchCappedInfo(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	s.cappedInfo = info
-	return info, nil
+	s.cappedOnce.Do(func() {
+		s.cappedInfo, s.cappedErr = s.fetchCappedInfo(ctx)
+	})
+	return s.cappedInfo, s.cappedErr
 }
 
 // RefreshCappedInfo forces a refresh of the cached capped collection info.
 func (s *MongoStore) RefreshCappedInfo(ctx context.Context) (*CappedInfo, error) {
-	s.cappedInfo = nil
+	s.cappedOnce = sync.Once{} // Reset for re-fetch
 	return s.GetCappedInfo(ctx)
 }
 
@@ -283,7 +285,7 @@ func (s *MongoStore) CreateCapped(ctx context.Context, sizeBytes int64, maxDocs 
 	}
 
 	// Refresh cached info
-	s.cappedInfo = nil
+	s.cappedOnce = sync.Once{}
 
 	return nil
 }
@@ -317,7 +319,7 @@ func (s *MongoStore) Get(ctx context.Context, id string) (*Message, error) {
 	var mongoMsg MongoMessage
 	err := s.collection.FindOne(ctx, filter).Decode(&mongoMsg)
 	if err != nil {
-		if err == mongo.ErrNoDocuments {
+		if errors.Is(err, mongo.ErrNoDocuments) {
 			return nil, fmt.Errorf("%s: %w", id, ErrNotFound)
 		}
 		return nil, fmt.Errorf("find: %w", err)
@@ -370,18 +372,15 @@ func (s *MongoStore) buildFilter(filter Filter) bson.M {
 		mongoFilter["event_name"] = filter.EventName
 	}
 
-	if !filter.StartTime.IsZero() {
-		if mongoFilter["created_at"] == nil {
-			mongoFilter["created_at"] = bson.M{}
+	if !filter.StartTime.IsZero() || !filter.EndTime.IsZero() {
+		createdFilter := bson.M{}
+		if !filter.StartTime.IsZero() {
+			createdFilter["$gte"] = filter.StartTime
 		}
-		mongoFilter["created_at"].(bson.M)["$gte"] = filter.StartTime
-	}
-
-	if !filter.EndTime.IsZero() {
-		if mongoFilter["created_at"] == nil {
-			mongoFilter["created_at"] = bson.M{}
+		if !filter.EndTime.IsZero() {
+			createdFilter["$lte"] = filter.EndTime
 		}
-		mongoFilter["created_at"].(bson.M)["$lte"] = filter.EndTime
+		mongoFilter["created_at"] = createdFilter
 	}
 
 	if filter.Error != "" {
@@ -572,7 +571,7 @@ func (s *MongoStore) GetByOriginalID(ctx context.Context, originalID string) (*M
 	var mongoMsg MongoMessage
 	err := s.collection.FindOne(ctx, filter).Decode(&mongoMsg)
 	if err != nil {
-		if err == mongo.ErrNoDocuments {
+		if errors.Is(err, mongo.ErrNoDocuments) {
 			return nil, fmt.Errorf("original_id %s: %w", originalID, ErrNotFound)
 		}
 		return nil, fmt.Errorf("find: %w", err)

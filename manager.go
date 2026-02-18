@@ -69,13 +69,6 @@ type Manager struct {
 // Implementations must be safe for concurrent use.
 type BackoffStrategy = backoff.Strategy
 
-// Resetter is an optional interface for backoff strategies that maintain state.
-// If a BackoffStrategy also implements Resetter, Reset() will be called before
-// retry attempts to clear any accumulated state.
-type Resetter interface {
-	Reset()
-}
-
 // Storer defines the interface for storing messages in a dead-letter queue.
 // This interface is satisfied by Manager and can be used by other packages
 // (like event-scheduler) to store failed messages without depending on

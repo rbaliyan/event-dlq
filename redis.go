@@ -3,8 +3,10 @@ package dlq
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -274,6 +276,9 @@ func (s *RedisStore) List(ctx context.Context, filter Filter) ([]*Message, error
 		if filter.Source != "" && msg.Source != filter.Source {
 			continue
 		}
+		if filter.Error != "" && !strings.Contains(strings.ToLower(msg.Error), strings.ToLower(filter.Error)) {
+			continue
+		}
 
 		messages = append(messages, msg)
 	}
@@ -302,7 +307,8 @@ func (s *RedisStore) Count(ctx context.Context, filter Filter) (int64, error) {
 		!filter.StartTime.IsZero() ||
 		!filter.EndTime.IsZero() ||
 		filter.MaxRetries > 0 ||
-		filter.Source != ""
+		filter.Source != "" ||
+		filter.Error != ""
 
 	if !hasComplexFilters {
 		if filter.EventName != "" {
@@ -488,7 +494,7 @@ func (s *RedisStore) GetByOriginalID(ctx context.Context, originalID string) (*M
 	originalKey := s.originalPrefix + originalID
 	dlqID, err := s.client.Get(ctx, originalKey).Result()
 	if err != nil {
-		if err == redis.Nil {
+		if errors.Is(err, redis.Nil) {
 			return nil, fmt.Errorf("original_id %s: %w", originalID, ErrNotFound)
 		}
 		return nil, fmt.Errorf("get original index: %w", err)

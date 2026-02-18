@@ -125,9 +125,10 @@ func WithCollection(name string) MongoStoreOption {
 // MongoStore is a MongoDB-based DLQ store
 type MongoStore struct {
 	collection *mongo.Collection
-	cappedOnce sync.Once   // Ensures cappedInfo is fetched only once
+	cappedMu   sync.Mutex  // Protects capped fields
+	cappedDone bool        // Whether capped info has been fetched
 	cappedInfo *cappedInfo // Cached capped info (nil = not checked yet)
-	cappedErr  error       // Error from first cappedInfo fetch
+	cappedErr  error       // Error from first capped info fetch
 }
 
 // NewMongoStore creates a new MongoDB DLQ store.
@@ -201,9 +202,12 @@ func (s *MongoStore) IsCapped(ctx context.Context) (bool, error) {
 // getCappedInfo returns detailed information about the collection's capped status.
 // The result is cached after the first call. Thread-safe.
 func (s *MongoStore) getCappedInfo(ctx context.Context) (*cappedInfo, error) {
-	s.cappedOnce.Do(func() {
+	s.cappedMu.Lock()
+	defer s.cappedMu.Unlock()
+	if !s.cappedDone {
 		s.cappedInfo, s.cappedErr = s.fetchCappedInfo(ctx)
-	})
+		s.cappedDone = true
+	}
 	return s.cappedInfo, s.cappedErr
 }
 
@@ -279,7 +283,11 @@ func (s *MongoStore) CreateCapped(ctx context.Context, sizeBytes int64, maxDocs 
 	}
 
 	// Refresh cached info
-	s.cappedOnce = sync.Once{}
+	s.cappedMu.Lock()
+	s.cappedDone = false
+	s.cappedInfo = nil
+	s.cappedErr = nil
+	s.cappedMu.Unlock()
 
 	return nil
 }
@@ -542,6 +550,10 @@ func (s *MongoStore) Stats(ctx context.Context) (*Stats, error) {
 			return nil, fmt.Errorf("decode: %w", err)
 		}
 		stats.MessagesByEvent[result.EventName] = result.Count
+	}
+
+	if err := cursor.Err(); err != nil {
+		return nil, fmt.Errorf("cursor iteration: %w", err)
 	}
 
 	// Find oldest and newest

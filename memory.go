@@ -58,6 +58,12 @@ func (s *MemoryStore) Get(ctx context.Context, id string) (*Message, error) {
 
 	// Return a copy
 	result := *msg
+	if msg.Metadata != nil {
+		result.Metadata = make(map[string]string, len(msg.Metadata))
+		for k, v := range msg.Metadata {
+			result.Metadata[k] = v
+		}
+	}
 	return &result, nil
 }
 
@@ -71,6 +77,12 @@ func (s *MemoryStore) List(ctx context.Context, filter Filter) ([]*Message, erro
 	for _, msg := range s.messages {
 		if s.matchesFilter(msg, filter) {
 			result := *msg
+			if msg.Metadata != nil {
+				result.Metadata = make(map[string]string, len(msg.Metadata))
+				for k, v := range msg.Metadata {
+					result.Metadata[k] = v
+				}
+			}
 			messages = append(messages, &result)
 		}
 	}
@@ -254,6 +266,12 @@ func (s *MemoryStore) GetByOriginalID(ctx context.Context, originalID string) (*
 	for _, msg := range s.messages {
 		if msg.OriginalID == originalID {
 			result := *msg
+			if msg.Metadata != nil {
+				result.Metadata = make(map[string]string, len(msg.Metadata))
+				for k, v := range msg.Metadata {
+					result.Metadata[k] = v
+				}
+			}
 			return &result, nil
 		}
 	}

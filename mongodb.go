@@ -349,7 +349,11 @@ func (s *MongoStore) List(ctx context.Context, filter Filter) ([]*Message, error
 		messages = append(messages, mongoMsg.toMessage())
 	}
 
-	return messages, cursor.Err()
+	if err := cursor.Err(); err != nil {
+		return nil, fmt.Errorf("cursor iteration: %w", err)
+	}
+
+	return messages, nil
 }
 
 // Count returns the number of messages matching the filter
@@ -572,33 +576,6 @@ func (s *MongoStore) GetByOriginalID(ctx context.Context, originalID string) (*M
 	}
 
 	return mongoMsg.toMessage(), nil
-}
-
-// GetByEventName retrieves all messages for a specific event
-func (s *MongoStore) GetByEventName(ctx context.Context, eventName string, limit int) ([]*Message, error) {
-	return s.List(ctx, Filter{
-		EventName: eventName,
-		Limit:     limit,
-	})
-}
-
-// IncrementRetryCount increments the retry count for a message
-func (s *MongoStore) IncrementRetryCount(ctx context.Context, id string) error {
-	filter := bson.M{"_id": id}
-	update := bson.M{
-		"$inc": bson.M{"retry_count": 1},
-	}
-
-	result, err := s.collection.UpdateOne(ctx, filter, update)
-	if err != nil {
-		return fmt.Errorf("update: %w", err)
-	}
-
-	if result.MatchedCount == 0 {
-		return fmt.Errorf("%s: %w", id, ErrNotFound)
-	}
-
-	return nil
 }
 
 // Compile-time checks

@@ -3,6 +3,7 @@ package dlq
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
@@ -184,7 +185,7 @@ func (s *PostgresStore) Get(ctx context.Context, id string) (*Message, error) {
 		&retriedAt,
 	)
 
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return nil, fmt.Errorf("%s: %w", id, ErrNotFound)
 	}
 	if err != nil {
@@ -406,7 +407,7 @@ func (s *PostgresStore) Stats(ctx context.Context) (*Stats, error) {
 	// Oldest and newest
 	var oldest, newest sql.NullTime
 	err = s.db.QueryRowContext(ctx, fmt.Sprintf("SELECT MIN(created_at), MAX(created_at) FROM %s", s.table)).Scan(&oldest, &newest)
-	if err != nil && err != sql.ErrNoRows {
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return nil, fmt.Errorf("min/max: %w", err)
 	}
 
@@ -446,7 +447,7 @@ func (s *PostgresStore) GetByOriginalID(ctx context.Context, originalID string) 
 		&retriedAt,
 	)
 
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return nil, fmt.Errorf("original_id %s: %w", originalID, ErrNotFound)
 	}
 	if err != nil {

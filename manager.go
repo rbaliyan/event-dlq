@@ -208,7 +208,14 @@ func WithMaxRetries(max int) ManagerOption {
 //	    dlq.WithBackoff(backoffStrategy),
 //	    dlq.WithMaxRetries(3),
 //	)
-func NewManager(store Store, r Republisher, opts ...ManagerOption) *Manager {
+func NewManager(store Store, r Republisher, opts ...ManagerOption) (*Manager, error) {
+	if store == nil {
+		return nil, fmt.Errorf("store is nil")
+	}
+	if r == nil {
+		return nil, fmt.Errorf("republisher is nil")
+	}
+
 	o := &managerOptions{
 		logger: slog.Default().With("component", "dlq.manager"),
 	}
@@ -223,13 +230,16 @@ func NewManager(store Store, r Republisher, opts ...ManagerOption) *Manager {
 		metrics:     o.metrics,
 		backoff:     o.backoff,
 		maxRetries:  o.maxRetries,
-	}
+	}, nil
 }
 
 // NewManagerWithTransport creates a DLQ manager using a transport for replay.
 // This wraps the transport in a Republisher adapter. For transports that don't
 // support Publish (e.g., MongoDB), use NewManager with a *event.Bus instead.
-func NewManagerWithTransport(store Store, t transport.Transport, opts ...ManagerOption) *Manager {
+func NewManagerWithTransport(store Store, t transport.Transport, opts ...ManagerOption) (*Manager, error) {
+	if t == nil {
+		return nil, fmt.Errorf("transport is nil")
+	}
 	return NewManager(store, &transportRepublisher{t: t}, opts...)
 }
 

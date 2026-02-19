@@ -60,7 +60,11 @@ func WithMaxLen(maxLen int64) RedisStoreOption {
 }
 
 // NewRedisStore creates a new Redis DLQ store.
-func NewRedisStore(client redis.Cmdable, opts ...RedisStoreOption) *RedisStore {
+func NewRedisStore(client redis.Cmdable, opts ...RedisStoreOption) (*RedisStore, error) {
+	if client == nil {
+		return nil, fmt.Errorf("client is nil")
+	}
+
 	o := &redisStoreOptions{
 		keyPrefix: "dlq:",
 	}
@@ -76,7 +80,7 @@ func NewRedisStore(client redis.Cmdable, opts ...RedisStoreOption) *RedisStore {
 		retriedKey:     o.keyPrefix + "retried",
 		originalPrefix: o.keyPrefix + "by_original:",
 		maxLen:         o.maxLen,
-	}
+	}, nil
 }
 
 // Store adds a message to the DLQ
@@ -243,7 +247,7 @@ func (s *RedisStore) List(ctx context.Context, filter Filter) ([]*Message, error
 	for i, id := range ids {
 		cmds[i] = pipe.HGetAll(ctx, s.msgPrefix+id)
 	}
-	if _, err := pipe.Exec(ctx); err != nil && err != redis.Nil {
+	if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
 		return nil, fmt.Errorf("pipeline hgetall: %w", err)
 	}
 

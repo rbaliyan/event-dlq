@@ -11,6 +11,15 @@ import (
 	"github.com/rbaliyan/event/v3/transport"
 )
 
+func mustNewManagerWithTransport(t testing.TB, store Store, tr transport.Transport, opts ...ManagerOption) *Manager {
+	t.Helper()
+	mgr, err := NewManagerWithTransport(store, tr, opts...)
+	if err != nil {
+		t.Fatalf("NewManagerWithTransport failed: %v", err)
+	}
+	return mgr
+}
+
 func TestMemoryStore(t *testing.T) {
 	ctx := context.Background()
 
@@ -409,7 +418,7 @@ func TestManager(t *testing.T) {
 	t.Run("Store creates DLQ message", func(t *testing.T) {
 		store := NewMemoryStore()
 		tr := &mockTransport{}
-		manager := NewManagerWithTransport(store, tr)
+		manager := mustNewManagerWithTransport(t, store, tr)
 
 		err := manager.Store(ctx, "order.created", "msg-123", []byte(`{"id":"order-1"}`),
 			map[string]string{"key": "value"}, errors.New("processing failed"), 3, "order-service")
@@ -435,7 +444,7 @@ func TestManager(t *testing.T) {
 	t.Run("Get retrieves message", func(t *testing.T) {
 		store := NewMemoryStore()
 		tr := &mockTransport{}
-		manager := NewManagerWithTransport(store, tr)
+		manager := mustNewManagerWithTransport(t, store, tr)
 
 		_ = manager.Store(ctx, "event", "msg-1", []byte("data"), nil, errors.New("error"), 1, "source")
 
@@ -453,7 +462,7 @@ func TestManager(t *testing.T) {
 	t.Run("List returns messages", func(t *testing.T) {
 		store := NewMemoryStore()
 		tr := &mockTransport{}
-		manager := NewManagerWithTransport(store, tr)
+		manager := mustNewManagerWithTransport(t, store, tr)
 
 		_ = manager.Store(ctx, "event-1", "msg-1", nil, nil, errors.New("error"), 1, "source")
 		_ = manager.Store(ctx, "event-2", "msg-2", nil, nil, errors.New("error"), 1, "source")
@@ -471,7 +480,7 @@ func TestManager(t *testing.T) {
 	t.Run("Count returns count", func(t *testing.T) {
 		store := NewMemoryStore()
 		tr := &mockTransport{}
-		manager := NewManagerWithTransport(store, tr)
+		manager := mustNewManagerWithTransport(t, store, tr)
 
 		_ = manager.Store(ctx, "event", "msg-1", nil, nil, errors.New("error"), 1, "source")
 		_ = manager.Store(ctx, "event", "msg-2", nil, nil, errors.New("error"), 1, "source")
@@ -489,7 +498,7 @@ func TestManager(t *testing.T) {
 	t.Run("Replay republishes messages", func(t *testing.T) {
 		store := NewMemoryStore()
 		tr := &mockTransport{}
-		manager := NewManagerWithTransport(store, tr)
+		manager := mustNewManagerWithTransport(t, store, tr)
 
 		_ = store.Store(ctx, &Message{
 			ID:         "dlq-1",
@@ -523,7 +532,7 @@ func TestManager(t *testing.T) {
 	t.Run("ReplaySingle replays one message", func(t *testing.T) {
 		store := NewMemoryStore()
 		tr := &mockTransport{}
-		manager := NewManagerWithTransport(store, tr)
+		manager := mustNewManagerWithTransport(t, store, tr)
 
 		_ = store.Store(ctx, &Message{
 			ID:         "dlq-1",
@@ -545,7 +554,7 @@ func TestManager(t *testing.T) {
 	t.Run("Delete removes message", func(t *testing.T) {
 		store := NewMemoryStore()
 		tr := &mockTransport{}
-		manager := NewManagerWithTransport(store, tr)
+		manager := mustNewManagerWithTransport(t, store, tr)
 
 		_ = store.Store(ctx, &Message{ID: "dlq-1", EventName: "event", CreatedAt: time.Now()})
 
@@ -563,7 +572,7 @@ func TestManager(t *testing.T) {
 	t.Run("DeleteByFilter removes matching messages", func(t *testing.T) {
 		store := NewMemoryStore()
 		tr := &mockTransport{}
-		manager := NewManagerWithTransport(store, tr)
+		manager := mustNewManagerWithTransport(t, store, tr)
 
 		_ = store.Store(ctx, &Message{ID: "dlq-1", EventName: "order.created", CreatedAt: time.Now()})
 		_ = store.Store(ctx, &Message{ID: "dlq-2", EventName: "order.updated", CreatedAt: time.Now()})
@@ -581,7 +590,7 @@ func TestManager(t *testing.T) {
 	t.Run("Cleanup removes old messages", func(t *testing.T) {
 		store := NewMemoryStore()
 		tr := &mockTransport{}
-		manager := NewManagerWithTransport(store, tr)
+		manager := mustNewManagerWithTransport(t, store, tr)
 
 		now := time.Now()
 		_ = store.Store(ctx, &Message{ID: "dlq-1", EventName: "event", CreatedAt: now.Add(-2 * time.Hour)})
@@ -600,7 +609,7 @@ func TestManager(t *testing.T) {
 	t.Run("Stats returns statistics", func(t *testing.T) {
 		store := NewMemoryStore()
 		tr := &mockTransport{}
-		manager := NewManagerWithTransport(store, tr)
+		manager := mustNewManagerWithTransport(t, store, tr)
 
 		_ = store.Store(ctx, &Message{ID: "dlq-1", EventName: "event", CreatedAt: time.Now()})
 		_ = store.Store(ctx, &Message{ID: "dlq-2", EventName: "event", CreatedAt: time.Now()})
@@ -618,7 +627,7 @@ func TestManager(t *testing.T) {
 	t.Run("Store with nil error does not panic", func(t *testing.T) {
 		store := NewMemoryStore()
 		tr := &mockTransport{}
-		manager := NewManagerWithTransport(store, tr)
+		manager := mustNewManagerWithTransport(t, store, tr)
 
 		err := manager.Store(ctx, "order.created", "msg-123", []byte(`{"id":"order-1"}`),
 			map[string]string{"key": "value"}, nil, 3, "order-service")
@@ -640,7 +649,7 @@ func TestManager(t *testing.T) {
 		store := NewMemoryStore()
 		tr := &mockTransport{}
 		// No WithMetrics option -- metrics is nil
-		manager := NewManagerWithTransport(store, tr)
+		manager := mustNewManagerWithTransport(t, store, tr)
 
 		// Store
 		err := manager.Store(ctx, "event", "msg-1", []byte("data"), nil, errors.New("fail"), 1, "src")
@@ -686,7 +695,7 @@ func TestManager(t *testing.T) {
 		store := NewMemoryStore()
 		tr := &mockTransport{failOn: "fail.event"}
 		backoff := &testBackoff{}
-		manager := NewManagerWithTransport(store, tr,
+		manager := mustNewManagerWithTransport(t, store, tr,
 			WithBackoff(backoff),
 			WithMaxRetries(2),
 		)

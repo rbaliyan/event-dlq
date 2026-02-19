@@ -135,7 +135,11 @@ func main() {
 	defer func() { _ = bus.Close(ctx) }()
 
 	// DLQ manager is still used for replay, stats, and cleanup
-	dlqManager := dlq.NewManager(dlqStore, bus, dlq.WithLogger(logger))
+	dlqManager, err := dlq.NewManager(dlqStore, bus, dlq.WithLogger(logger))
+	if err != nil {
+		logger.Error("failed to create DLQ manager", "error", err)
+		os.Exit(1)
+	}
 
 	// ============================================================
 	// STEP 5: Define Events

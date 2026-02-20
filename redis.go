@@ -62,7 +62,7 @@ func WithMaxLen(maxLen int64) RedisStoreOption {
 // NewRedisStore creates a new Redis DLQ store.
 func NewRedisStore(client redis.Cmdable, opts ...RedisStoreOption) (*RedisStore, error) {
 	if client == nil {
-		return nil, fmt.Errorf("client is nil")
+		return nil, errors.New("redis: client is required")
 	}
 
 	o := &redisStoreOptions{

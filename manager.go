@@ -2,6 +2,7 @@ package dlq
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -210,10 +211,10 @@ func WithMaxRetries(max int) ManagerOption {
 //	)
 func NewManager(store Store, r Republisher, opts ...ManagerOption) (*Manager, error) {
 	if store == nil {
-		return nil, fmt.Errorf("store is nil")
+		return nil, errors.New("manager: store is required")
 	}
 	if r == nil {
-		return nil, fmt.Errorf("republisher is nil")
+		return nil, errors.New("manager: republisher is required")
 	}
 
 	o := &managerOptions{
@@ -238,7 +239,7 @@ func NewManager(store Store, r Republisher, opts ...ManagerOption) (*Manager, er
 // support Publish (e.g., MongoDB), use NewManager with a *event.Bus instead.
 func NewManagerWithTransport(store Store, t transport.Transport, opts ...ManagerOption) (*Manager, error) {
 	if t == nil {
-		return nil, fmt.Errorf("transport is nil")
+		return nil, errors.New("manager: transport is required")
 	}
 	return NewManager(store, &transportRepublisher{t: t}, opts...)
 }
@@ -440,10 +441,12 @@ func (m *Manager) replayMessageWithRetry(ctx context.Context, msg *Message) erro
 				"attempt", attempt+1,
 				"backoff_delay", backoffDelay)
 
+			timer := time.NewTimer(backoffDelay)
 			select {
 			case <-ctx.Done():
+				timer.Stop()
 				return ctx.Err()
-			case <-time.After(backoffDelay):
+			case <-timer.C:
 				// Continue with retry
 			}
 		}

@@ -66,7 +66,11 @@ func main() {
 	// event are written in the same transaction. If the transaction
 	// fails, neither is persisted.
 
-	outboxStore := outbox.NewMongoStore(internalDB, outbox.WithCollection("_outbox"))
+	outboxStore, err := outbox.NewMongoStore(internalDB, outbox.WithCollection("_outbox"))
+	if err != nil {
+		logger.Error("failed to create outbox store", "error", err)
+		os.Exit(1)
+	}
 
 	// Create indexes for efficient querying
 	if err := outboxStore.EnsureIndexes(ctx); err != nil {
@@ -198,9 +202,15 @@ func main() {
 	// STEP 7: Setup Outbox Relay (Background Publisher)
 	// ============================================================
 
+	relayTokenStore, err := outbox.NewMongoResumeTokenStore(internalDB, "outbox-relay")
+	if err != nil {
+		logger.Error("failed to create relay resume token store", "error", err)
+		os.Exit(1)
+	}
+
 	relay := outbox.NewMongoRelay(outboxStore, transport).
 		WithMode(outbox.RelayModeChangeStream). // Real-time with change streams
-		WithResumeTokenStore(outbox.NewMongoResumeTokenStore(internalDB, "outbox-relay")).
+		WithResumeTokenStore(relayTokenStore).
 		WithStuckDuration(5 * time.Minute). // Recover stuck messages
 		WithLogger(logger)
 

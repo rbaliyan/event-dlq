@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/rbaliyan/event/v3/health"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
@@ -590,6 +591,37 @@ func (s *MongoStore) GetByOriginalID(ctx context.Context, originalID string) (*M
 	return mongoMsg.toMessage(), nil
 }
 
+// Health performs a health check by pinging the MongoDB database.
+// Returns healthy if the ping succeeds, unhealthy otherwise.
+func (s *MongoStore) Health(ctx context.Context) *health.Result {
+	start := time.Now()
+
+	err := s.collection.Database().Client().Ping(ctx, nil)
+	if err != nil {
+		return &health.Result{
+			Status:    health.StatusUnhealthy,
+			Message:   fmt.Sprintf("ping failed: %v", err),
+			Latency:   time.Since(start),
+			CheckedAt: start,
+			Details: map[string]any{
+				"database":   s.collection.Database().Name(),
+				"collection": s.collection.Name(),
+			},
+		}
+	}
+
+	return &health.Result{
+		Status:    health.StatusHealthy,
+		Latency:   time.Since(start),
+		CheckedAt: start,
+		Details: map[string]any{
+			"database":   s.collection.Database().Name(),
+			"collection": s.collection.Name(),
+		},
+	}
+}
+
 // Compile-time checks
 var _ Store = (*MongoStore)(nil)
 var _ StatsProvider = (*MongoStore)(nil)
+var _ health.Checker = (*MongoStore)(nil)

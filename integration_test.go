@@ -10,6 +10,7 @@ import (
 	"time"
 
 	_ "github.com/lib/pq"
+	"github.com/rbaliyan/event/v3/health"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
@@ -168,6 +169,59 @@ func TestMongoStoreCappedIntegration(t *testing.T) {
 	if deleted != 0 {
 		t.Errorf("expected 0 deleted for capped collection, got %d", deleted)
 	}
+}
+
+func TestMongoStoreHealth(t *testing.T) {
+	client := getMongoClient(t)
+	ctx := context.Background()
+
+	dbName := "dlq_health_test_" + time.Now().Format("20060102150405")
+	db := client.Database(dbName)
+	t.Cleanup(func() {
+		db.Drop(context.Background())
+	})
+
+	store, err := NewMongoStore(db, WithCollection("dlq_health"))
+	if err != nil {
+		t.Fatalf("NewMongoStore failed: %v", err)
+	}
+
+	t.Run("healthy when connected", func(t *testing.T) {
+		result := store.Health(ctx)
+		if result.Status != health.StatusHealthy {
+			t.Errorf("expected healthy, got %s: %s", result.Status, result.Message)
+		}
+		if result.Details["collection"] != "dlq_health" {
+			t.Errorf("expected collection dlq_health, got %v", result.Details["collection"])
+		}
+		if result.Latency <= 0 {
+			t.Error("expected positive latency")
+		}
+	})
+
+	t.Run("unhealthy when disconnected", func(t *testing.T) {
+		// Create a separate client and disconnect it
+		badClient, err := mongo.Connect(options.Client().ApplyURI("mongodb://localhost:1"))
+		if err != nil {
+			t.Skipf("could not create bad client: %v", err)
+		}
+		badDB := badClient.Database("nonexistent")
+		badStore, err := NewMongoStore(badDB, WithCollection("bad"))
+		if err != nil {
+			t.Fatalf("NewMongoStore failed: %v", err)
+		}
+
+		tctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		defer cancel()
+
+		result := badStore.Health(tctx)
+		if result.Status != health.StatusUnhealthy {
+			t.Errorf("expected unhealthy, got %s", result.Status)
+		}
+		if result.Message == "" {
+			t.Error("expected non-empty message for unhealthy status")
+		}
+	})
 }
 
 func TestPostgresStoreIntegration(t *testing.T) {

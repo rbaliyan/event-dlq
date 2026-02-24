@@ -177,10 +177,10 @@ func (s *RedisStore) Store(ctx context.Context, msg *Message) error {
 		"created_at", msg.CreatedAt.Unix(),
 	}
 
-	numFields := len(fieldPairs) / 2
+	const numFields = 9 // number of key-value pairs in fieldPairs
 
 	// ARGV: [numFields, field1, val1, field2, val2, ..., maxLen, msgID]
-	argv := make([]interface{}, 0, len(fieldPairs)+3)
+	argv := make([]interface{}, 0, numFields*2+3)
 	argv = append(argv, numFields)
 	argv = append(argv, fieldPairs...)
 	argv = append(argv, s.maxLen)

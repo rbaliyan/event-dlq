@@ -6,9 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
-	"strings"
 	"time"
 
+	"github.com/rbaliyan/event/v3/health"
 	"github.com/rbaliyan/event/v3/store/base"
 )
 
@@ -259,8 +259,9 @@ func (s *PostgresStore) Count(ctx context.Context, filter Filter) (int64, error)
 	return count, nil
 }
 
-// buildListQuery builds the SQL query for List and Count
-func (s *PostgresStore) buildListQuery(filter Filter, countOnly bool) (string, []any) {
+// buildFilterClauses returns a QueryBuilder populated with the standard
+// DLQ filter conditions. Callers use it to construct SELECT, COUNT, or DELETE queries.
+func (s *PostgresStore) buildFilterClauses(filter Filter) *base.QueryBuilder {
 	qb := base.NewQueryBuilder()
 
 	qb.AddIfNotEmpty("event_name = $%d", filter.EventName)
@@ -272,6 +273,13 @@ func (s *PostgresStore) buildListQuery(filter Filter, countOnly bool) (string, [
 	qb.AddIfPositive("retry_count <= $%d", filter.MaxRetries)
 	qb.AddIfNotEmpty("source = $%d", filter.Source)
 	qb.AddRawIf(filter.ExcludeRetried, "retried_at IS NULL")
+
+	return qb
+}
+
+// buildListQuery builds the SQL query for List and Count
+func (s *PostgresStore) buildListQuery(filter Filter, countOnly bool) (string, []any) {
+	qb := s.buildFilterClauses(filter)
 
 	if countOnly {
 		return qb.Build(fmt.Sprintf("SELECT COUNT(*) FROM %s %%s", s.table))
@@ -347,20 +355,22 @@ func (s *PostgresStore) DeleteOlderThan(ctx context.Context, age time.Duration) 
 
 // DeleteByFilter removes messages matching the filter
 func (s *PostgresStore) DeleteByFilter(ctx context.Context, filter Filter) (int64, error) {
-	listQuery, args := s.buildListQuery(filter, false)
-	// Convert SELECT to DELETE
-	deleteQuery := strings.Replace(listQuery, "SELECT id, event_name, original_id, payload, metadata, error, retry_count, source, created_at, retried_at", "DELETE", 1)
-	// Remove ORDER BY and LIMIT for delete
-	if idx := strings.Index(deleteQuery, "ORDER BY"); idx > 0 {
-		deleteQuery = deleteQuery[:idx]
-	}
+	query, args := s.buildDeleteQuery(filter)
 
-	result, err := s.db.ExecContext(ctx, deleteQuery, args...)
+	result, err := s.db.ExecContext(ctx, query, args...)
 	if err != nil {
 		return 0, fmt.Errorf("delete: %w", err)
 	}
 
 	return result.RowsAffected()
+}
+
+// buildDeleteQuery builds a DELETE SQL query from the filter.
+// It reuses the same filter clause logic as buildListQuery but constructs
+// the DELETE statement directly instead of transforming a SELECT.
+func (s *PostgresStore) buildDeleteQuery(filter Filter) (string, []any) {
+	qb := s.buildFilterClauses(filter)
+	return qb.Build(fmt.Sprintf("DELETE FROM %s %%s", s.table))
 }
 
 // Stats returns DLQ statistics
@@ -461,6 +471,51 @@ func (s *PostgresStore) GetByOriginalID(ctx context.Context, originalID string) 
 	return &msg, nil
 }
 
+// Health performs a health check by pinging the PostgreSQL database.
+// Returns healthy if the ping succeeds, unhealthy otherwise.
+func (s *PostgresStore) Health(ctx context.Context) *health.Result {
+	start := time.Now()
+
+	err := s.db.PingContext(ctx)
+	if err != nil {
+		return &health.Result{
+			Status:    health.StatusUnhealthy,
+			Message:   fmt.Sprintf("ping failed: %v", err),
+			Latency:   time.Since(start),
+			CheckedAt: start,
+			Details: map[string]any{
+				"table": s.table,
+			},
+		}
+	}
+
+	// Get message count
+	var count int64
+	err = s.db.QueryRowContext(ctx, fmt.Sprintf("SELECT COUNT(*) FROM %s", s.table)).Scan(&count)
+	if err != nil {
+		return &health.Result{
+			Status:    health.StatusUnhealthy,
+			Message:   fmt.Sprintf("count failed: %v", err),
+			Latency:   time.Since(start),
+			CheckedAt: start,
+			Details: map[string]any{
+				"table": s.table,
+			},
+		}
+	}
+
+	return &health.Result{
+		Status:    health.StatusHealthy,
+		Latency:   time.Since(start),
+		CheckedAt: start,
+		Details: map[string]any{
+			"table":         s.table,
+			"message_count": count,
+		},
+	}
+}
+
 // Compile-time checks
 var _ Store = (*PostgresStore)(nil)
 var _ StatsProvider = (*PostgresStore)(nil)
+var _ health.Checker = (*PostgresStore)(nil)

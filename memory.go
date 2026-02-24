@@ -6,6 +6,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/rbaliyan/event/v3/health"
 )
 
 // MemoryStore is an in-memory DLQ store for testing
@@ -279,6 +281,23 @@ func (s *MemoryStore) GetByOriginalID(ctx context.Context, originalID string) (*
 	return nil, fmt.Errorf("original_id %s: %w", originalID, ErrNotFound)
 }
 
+// Health performs a health check on the in-memory store.
+// Always returns healthy with the current message count.
+func (s *MemoryStore) Health(ctx context.Context) *health.Result {
+	s.mu.RLock()
+	count := len(s.messages)
+	s.mu.RUnlock()
+
+	return &health.Result{
+		Status:    health.StatusHealthy,
+		CheckedAt: time.Now(),
+		Details: map[string]any{
+			"message_count": count,
+		},
+	}
+}
+
 // Compile-time checks
 var _ Store = (*MemoryStore)(nil)
 var _ StatsProvider = (*MemoryStore)(nil)
+var _ health.Checker = (*MemoryStore)(nil)

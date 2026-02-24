@@ -420,8 +420,15 @@ func TestManager(t *testing.T) {
 		tr := &mockTransport{}
 		manager := mustNewManagerWithTransport(t, store, tr)
 
-		err := manager.Store(ctx, "order.created", "msg-123", []byte(`{"id":"order-1"}`),
-			map[string]string{"key": "value"}, errors.New("processing failed"), 3, "order-service")
+		err := manager.Store(ctx, StoreParams{
+			EventName:  "order.created",
+			OriginalID: "msg-123",
+			Payload:    []byte(`{"id":"order-1"}`),
+			Metadata:   map[string]string{"key": "value"},
+			Err:        errors.New("processing failed"),
+			RetryCount: 3,
+			Source:     "order-service",
+		})
 
 		if err != nil {
 			t.Fatalf("Store failed: %v", err)
@@ -446,7 +453,7 @@ func TestManager(t *testing.T) {
 		tr := &mockTransport{}
 		manager := mustNewManagerWithTransport(t, store, tr)
 
-		_ = manager.Store(ctx, "event", "msg-1", []byte("data"), nil, errors.New("error"), 1, "source")
+		_ = manager.Store(ctx, StoreParams{EventName: "event", OriginalID: "msg-1", Payload: []byte("data"), Err: errors.New("error"), RetryCount: 1, Source: "source"})
 
 		messages, _ := store.List(ctx, Filter{})
 		msg, err := manager.Get(ctx, messages[0].ID)
@@ -464,8 +471,8 @@ func TestManager(t *testing.T) {
 		tr := &mockTransport{}
 		manager := mustNewManagerWithTransport(t, store, tr)
 
-		_ = manager.Store(ctx, "event-1", "msg-1", nil, nil, errors.New("error"), 1, "source")
-		_ = manager.Store(ctx, "event-2", "msg-2", nil, nil, errors.New("error"), 1, "source")
+		_ = manager.Store(ctx, StoreParams{EventName: "event-1", OriginalID: "msg-1", Err: errors.New("error"), RetryCount: 1, Source: "source"})
+		_ = manager.Store(ctx, StoreParams{EventName: "event-2", OriginalID: "msg-2", Err: errors.New("error"), RetryCount: 1, Source: "source"})
 
 		messages, err := manager.List(ctx, Filter{})
 		if err != nil {
@@ -482,8 +489,8 @@ func TestManager(t *testing.T) {
 		tr := &mockTransport{}
 		manager := mustNewManagerWithTransport(t, store, tr)
 
-		_ = manager.Store(ctx, "event", "msg-1", nil, nil, errors.New("error"), 1, "source")
-		_ = manager.Store(ctx, "event", "msg-2", nil, nil, errors.New("error"), 1, "source")
+		_ = manager.Store(ctx, StoreParams{EventName: "event", OriginalID: "msg-1", Err: errors.New("error"), RetryCount: 1, Source: "source"})
+		_ = manager.Store(ctx, StoreParams{EventName: "event", OriginalID: "msg-2", Err: errors.New("error"), RetryCount: 1, Source: "source"})
 
 		count, err := manager.Count(ctx, Filter{})
 		if err != nil {
@@ -629,8 +636,14 @@ func TestManager(t *testing.T) {
 		tr := &mockTransport{}
 		manager := mustNewManagerWithTransport(t, store, tr)
 
-		err := manager.Store(ctx, "order.created", "msg-123", []byte(`{"id":"order-1"}`),
-			map[string]string{"key": "value"}, nil, 3, "order-service")
+		err := manager.Store(ctx, StoreParams{
+			EventName:  "order.created",
+			OriginalID: "msg-123",
+			Payload:    []byte(`{"id":"order-1"}`),
+			Metadata:   map[string]string{"key": "value"},
+			RetryCount: 3,
+			Source:     "order-service",
+		})
 
 		if err != nil {
 			t.Fatalf("Store with nil error failed: %v", err)
@@ -652,7 +665,7 @@ func TestManager(t *testing.T) {
 		manager := mustNewManagerWithTransport(t, store, tr)
 
 		// Store
-		err := manager.Store(ctx, "event", "msg-1", []byte("data"), nil, errors.New("fail"), 1, "src")
+		err := manager.Store(ctx, StoreParams{EventName: "event", OriginalID: "msg-1", Payload: []byte("data"), Err: errors.New("fail"), RetryCount: 1, Source: "src"})
 		if err != nil {
 			t.Fatalf("Store failed: %v", err)
 		}

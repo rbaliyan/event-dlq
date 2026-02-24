@@ -591,8 +591,9 @@ func (s *MongoStore) GetByOriginalID(ctx context.Context, originalID string) (*M
 	return mongoMsg.toMessage(), nil
 }
 
-// Health performs a health check by pinging the MongoDB database.
-// Returns healthy if the ping succeeds, unhealthy otherwise.
+// Health performs a health check by pinging the MongoDB database and counting documents.
+// Returns healthy if both the ping and count succeed, unhealthy otherwise.
+// The result includes message_count in details, matching RedisStore and PostgresStore.
 func (s *MongoStore) Health(ctx context.Context) *health.Result {
 	start := time.Now()
 
@@ -610,13 +611,29 @@ func (s *MongoStore) Health(ctx context.Context) *health.Result {
 		}
 	}
 
+	// Get message count to include in health details
+	count, err := s.collection.CountDocuments(ctx, bson.M{})
+	if err != nil {
+		return &health.Result{
+			Status:    health.StatusUnhealthy,
+			Message:   fmt.Sprintf("count failed: %v", err),
+			Latency:   time.Since(start),
+			CheckedAt: start,
+			Details: map[string]any{
+				"database":   s.collection.Database().Name(),
+				"collection": s.collection.Name(),
+			},
+		}
+	}
+
 	return &health.Result{
 		Status:    health.StatusHealthy,
 		Latency:   time.Since(start),
 		CheckedAt: start,
 		Details: map[string]any{
-			"database":   s.collection.Database().Name(),
-			"collection": s.collection.Name(),
+			"database":      s.collection.Database().Name(),
+			"collection":    s.collection.Name(),
+			"message_count": count,
 		},
 	}
 }

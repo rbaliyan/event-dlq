@@ -132,7 +132,15 @@ dlqManager := dlq.NewManager(dlqStore, transport)
 
 // In handler
 if retryCount >= maxRetries {
-    dlqManager.Store(ctx, eventName, eventID, payload, metadata, err, retryCount, "source")
+    dlqManager.Store(ctx, dlq.StoreParams{
+        EventName:  eventName,
+        OriginalID: eventID,
+        Payload:    payload,
+        Metadata:   metadata,
+        Err:        err,
+        RetryCount: retryCount,
+        Source:     "source",
+    })
     return nil // Ack to prevent infinite retries
 }
 return err // Nack for redelivery

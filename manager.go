@@ -30,7 +30,15 @@ import (
 //	manager := dlq.NewManager(store, transport)
 //
 //	// Store a failed message
-//	manager.Store(ctx, "order.process", msg.ID, payload, metadata, err, 3, "order-service")
+//	manager.Store(ctx, dlq.StoreParams{
+//	    EventName:  "order.process",
+//	    OriginalID: msg.ID,
+//	    Payload:    payload,
+//	    Metadata:   metadata,
+//	    Err:        err,
+//	    RetryCount: 3,
+//	    Source:     "order-service",
+//	})
 //
 //	// Replay failed messages
 //	replayed, err := manager.Replay(ctx, dlq.Filter{
@@ -70,21 +78,32 @@ type Manager struct {
 // Implementations must be safe for concurrent use.
 type BackoffStrategy = backoff.Strategy
 
+// StoreParams contains the parameters for storing a failed message in the DLQ.
+type StoreParams struct {
+	// EventName is the name of the event that failed.
+	EventName string
+	// OriginalID is the original message ID.
+	OriginalID string
+	// Payload is the message payload.
+	Payload []byte
+	// Metadata contains additional message metadata.
+	Metadata map[string]string
+	// Err is the error that caused the failure.
+	Err error
+	// RetryCount is the number of retries attempted.
+	RetryCount int
+	// Source is the source service identifier.
+	Source string
+}
+
 // Storer defines the interface for storing messages in a dead-letter queue.
 // This interface is satisfied by Manager and can be used by other packages
 // (like event-scheduler) to store failed messages without depending on
 // the full DLQ package.
 //
-// Example usage in other packages:
-//
-//	type DeadLetterQueue interface {
-//	    Store(ctx context.Context, eventName, originalID string, payload []byte,
-//	          metadata map[string]string, err error, retryCount int, source string) error
-//	}
-//
 // The Manager type from this package satisfies this interface.
 type Storer interface {
-	Store(ctx context.Context, eventName, originalID string, payload []byte, metadata map[string]string, err error, retryCount int, source string) error
+	Store(ctx context.Context, params StoreParams) error
 }
 
 // Compile-time check that Manager satisfies Storer
@@ -249,16 +268,6 @@ func NewManagerWithTransport(store Store, t transport.Transport, opts ...Manager
 // Call this when a message has exhausted all retries and needs to be
 // preserved for later investigation or replay.
 //
-// Parameters:
-//   - ctx: Context for cancellation and deadlines
-//   - eventName: The original event name/topic
-//   - originalID: The original message ID for correlation
-//   - payload: The message payload (typically JSON)
-//   - metadata: Original message metadata
-//   - err: The error that caused the failure
-//   - retryCount: Number of retries attempted
-//   - source: Source service identifier for debugging
-//
 // Example:
 //
 //	func handleWithDLQ(ctx context.Context, msg Message) error {
@@ -267,44 +276,51 @@ func NewManagerWithTransport(store Store, t transport.Transport, opts ...Manager
 //	            return nil
 //	        }
 //	    }
-//	    return dlqManager.Store(ctx, event.Name, msg.ID, msg.Payload,
-//	        msg.Metadata, err, maxRetries, "order-service")
+//	    return dlqManager.Store(ctx, dlq.StoreParams{
+//	        EventName:  event.Name,
+//	        OriginalID: msg.ID,
+//	        Payload:    msg.Payload,
+//	        Metadata:   msg.Metadata,
+//	        Err:        err,
+//	        RetryCount: maxRetries,
+//	        Source:     "order-service",
+//	    })
 //	}
-func (m *Manager) Store(ctx context.Context, eventName, originalID string, payload []byte, metadata map[string]string, err error, retryCount int, source string) error {
+func (m *Manager) Store(ctx context.Context, params StoreParams) error {
 	var errMsg string
-	if err != nil {
-		errMsg = err.Error()
+	if params.Err != nil {
+		errMsg = params.Err.Error()
 	} else {
 		errMsg = "unknown error"
 	}
 	msg := &Message{
 		ID:         uuid.New().String(),
-		EventName:  eventName,
-		OriginalID: originalID,
-		Payload:    payload,
-		Metadata:   metadata,
+		EventName:  params.EventName,
+		OriginalID: params.OriginalID,
+		Payload:    params.Payload,
+		Metadata:   params.Metadata,
 		Error:      errMsg,
-		RetryCount: retryCount,
+		RetryCount: params.RetryCount,
 		CreatedAt:  time.Now(),
-		Source:     source,
+		Source:     params.Source,
 	}
 
 	if storeErr := m.store.Store(ctx, msg); storeErr != nil {
 		m.logger.Error("failed to store DLQ message",
-			"event", eventName,
-			"original_id", originalID,
+			"event", params.EventName,
+			"original_id", params.OriginalID,
 			"error", storeErr)
 		return fmt.Errorf("store dlq message: %w", storeErr)
 	}
 
 	// Record metrics
-	m.metrics.RecordMessageStored(ctx, eventName, errMsg)
+	m.metrics.RecordMessageStored(ctx, params.EventName, errMsg)
 
 	m.logger.Info("stored message in DLQ",
 		"id", msg.ID,
-		"event", eventName,
-		"original_id", originalID,
-		"retry_count", retryCount)
+		"event", params.EventName,
+		"original_id", params.OriginalID,
+		"retry_count", params.RetryCount)
 
 	return nil
 }

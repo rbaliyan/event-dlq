@@ -149,8 +149,15 @@ func BenchmarkManagerStore(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = manager.Store(ctx, "orders.created", "orig-"+string(rune(i)), payload,
-			map[string]string{"key": "value"}, err, 3, "order-service")
+		_ = manager.Store(ctx, StoreParams{
+			EventName:  "orders.created",
+			OriginalID: "orig-" + string(rune(i)),
+			Payload:    payload,
+			Metadata:   map[string]string{"key": "value"},
+			Err:        err,
+			RetryCount: 3,
+			Source:     "order-service",
+		})
 	}
 }
 

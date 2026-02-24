@@ -5,12 +5,59 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/rbaliyan/event/v3/health"
 	"github.com/redis/go-redis/v9"
 )
+
+// storeScript atomically stores a DLQ message in Redis using a Lua script.
+// This ensures the hash, stream entry, stream_id back-reference, and event index
+// are all written together or not at all.
+//
+// KEYS[1] = message hash key (dlq:msg:{id})
+// KEYS[2] = stream key (dlq:messages)
+// KEYS[3] = event index key (dlq:by_event:{event_name})
+//
+// ARGV[1]  = number of hash field-value pairs (N)
+// ARGV[2..2*N+1] = hash field-value pairs
+// ARGV[2*N+2] = maxLen (0 means no limit)
+// ARGV[2*N+3] = message ID (for the stream entry value)
+var storeScript = redis.NewScript(`
+local hashKey = KEYS[1]
+local streamKey = KEYS[2]
+local eventIndexKey = KEYS[3]
+
+local numFields = tonumber(ARGV[1])
+local maxLen = tonumber(ARGV[numFields * 2 + 2])
+local msgID = ARGV[numFields * 2 + 3]
+
+-- HSet message hash
+local hashArgs = {}
+for i = 1, numFields * 2 do
+    hashArgs[i] = ARGV[i + 1]
+end
+redis.call('HSET', hashKey, unpack(hashArgs))
+
+-- XAdd to stream
+local streamID
+if maxLen > 0 then
+    streamID = redis.call('XADD', streamKey, 'MAXLEN', '~', tostring(maxLen), '*', 'id', msgID)
+else
+    streamID = redis.call('XADD', streamKey, '*', 'id', msgID)
+end
+
+-- Store stream entry ID back in hash
+redis.call('HSET', hashKey, 'stream_id', streamID)
+
+-- Add to event index
+redis.call('SADD', eventIndexKey, msgID)
+
+return streamID
+`)
 
 /*
 Redis Schema:
@@ -25,6 +72,7 @@ Uses Redis Streams and Hashes for DLQ:
 // RedisStore is a Redis-based DLQ store
 type RedisStore struct {
 	client         redis.Cmdable
+	logger         *slog.Logger
 	streamKey      string
 	msgPrefix      string
 	eventPrefix    string
@@ -39,6 +87,7 @@ type RedisStoreOption func(*redisStoreOptions)
 type redisStoreOptions struct {
 	keyPrefix string
 	maxLen    int64
+	logger    *slog.Logger
 }
 
 // WithKeyPrefix sets a custom key prefix for all Redis keys.
@@ -46,6 +95,15 @@ func WithKeyPrefix(prefix string) RedisStoreOption {
 	return func(o *redisStoreOptions) {
 		if prefix != "" {
 			o.keyPrefix = prefix
+		}
+	}
+}
+
+// WithRedisLogger sets the logger for the Redis store.
+func WithRedisLogger(logger *slog.Logger) RedisStoreOption {
+	return func(o *redisStoreOptions) {
+		if logger != nil {
+			o.logger = logger
 		}
 	}
 }
@@ -72,8 +130,14 @@ func NewRedisStore(client redis.Cmdable, opts ...RedisStoreOption) (*RedisStore,
 		opt(o)
 	}
 
+	logger := o.logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+
 	return &RedisStore{
 		client:         client,
+		logger:         logger,
 		streamKey:      o.keyPrefix + "messages",
 		msgPrefix:      o.keyPrefix + "msg:",
 		eventPrefix:    o.keyPrefix + "by_event:",
@@ -83,7 +147,11 @@ func NewRedisStore(client redis.Cmdable, opts ...RedisStoreOption) (*RedisStore,
 	}, nil
 }
 
-// Store adds a message to the DLQ
+// Store adds a message to the DLQ.
+// The core operations (hash, stream, stream_id back-reference, event index)
+// are executed atomically via a Lua script. The optional reverse-lookup index
+// by original ID is written separately since its failure should not roll back
+// the main store operation.
 func (s *RedisStore) Store(ctx context.Context, msg *Message) error {
 	if msg == nil {
 		return fmt.Errorf("message is nil")
@@ -92,59 +160,49 @@ func (s *RedisStore) Store(ctx context.Context, msg *Message) error {
 		return fmt.Errorf("message ID is required")
 	}
 
-	// Store message details in hash
 	msgKey := s.msgPrefix + msg.ID
+	eventKey := s.eventPrefix + msg.EventName
 	metadata, _ := json.Marshal(msg.Metadata)
 
-	fields := map[string]interface{}{
-		"id":          msg.ID,
-		"event_name":  msg.EventName,
-		"original_id": msg.OriginalID,
-		"payload":     msg.Payload,
-		"metadata":    metadata,
-		"error":       msg.Error,
-		"retry_count": msg.RetryCount,
-		"source":      msg.Source,
-		"created_at":  msg.CreatedAt.Unix(),
+	// Build flat field-value pairs for the Lua script
+	fieldPairs := []interface{}{
+		"id", msg.ID,
+		"event_name", msg.EventName,
+		"original_id", msg.OriginalID,
+		"payload", msg.Payload,
+		"metadata", metadata,
+		"error", msg.Error,
+		"retry_count", msg.RetryCount,
+		"source", msg.Source,
+		"created_at", msg.CreatedAt.Unix(),
 	}
 
-	if err := s.client.HSet(ctx, msgKey, fields).Err(); err != nil {
-		return fmt.Errorf("hset: %w", err)
-	}
+	numFields := len(fieldPairs) / 2
 
-	// Add to stream for ordering
-	args := &redis.XAddArgs{
-		Stream: s.streamKey,
-		Values: map[string]interface{}{
-			"id": msg.ID,
-		},
-	}
-	if s.maxLen > 0 {
-		args.MaxLen = s.maxLen
-		args.Approx = true
-	}
+	// ARGV: [numFields, field1, val1, field2, val2, ..., maxLen, msgID]
+	argv := make([]interface{}, 0, len(fieldPairs)+3)
+	argv = append(argv, numFields)
+	argv = append(argv, fieldPairs...)
+	argv = append(argv, s.maxLen)
+	argv = append(argv, msg.ID)
 
-	streamID, err := s.client.XAdd(ctx, args).Result()
+	keys := []string{msgKey, s.streamKey, eventKey}
+
+	_, err := storeScript.Run(ctx, s.client, keys, argv...).Result()
 	if err != nil {
-		return fmt.Errorf("xadd: %w", err)
+		return fmt.Errorf("store script: %w", err)
 	}
 
-	// Store stream entry ID for later deletion
-	if err := s.client.HSet(ctx, msgKey, "stream_id", streamID).Err(); err != nil {
-		return fmt.Errorf("hset stream_id: %w", err)
-	}
-
-	// Add to event index
-	eventKey := s.eventPrefix + msg.EventName
-	if err := s.client.SAdd(ctx, eventKey, msg.ID).Err(); err != nil {
-		return fmt.Errorf("sadd event index: %w", err)
-	}
-
-	// Add reverse-lookup index by original ID
+	// Add reverse-lookup index by original ID (separate concern).
+	// The core data is already committed via the Lua script above,
+	// so we log a warning instead of returning an error.
 	if msg.OriginalID != "" {
 		originalKey := s.originalPrefix + msg.OriginalID
 		if err := s.client.Set(ctx, originalKey, msg.ID, 0).Err(); err != nil {
-			return fmt.Errorf("set original index: %w", err)
+			s.logger.Warn("failed to set original ID index",
+				"original_id", msg.OriginalID,
+				"message_id", msg.ID,
+				"error", err)
 		}
 	}
 
@@ -333,27 +391,50 @@ func (s *RedisStore) Count(ctx context.Context, filter Filter) (int64, error) {
 	return int64(len(messages)), nil
 }
 
-// MarkRetried marks a message as replayed
+// markRetriedScript atomically marks a DLQ message as retried.
+// It checks the message exists, sets retried_at, and adds to the retried set.
+//
+// KEYS[1] = message hash key (dlq:msg:{id})
+// KEYS[2] = retried set key (dlq:retried)
+//
+// ARGV[1] = message ID
+// ARGV[2] = retried_at unix timestamp
+//
+// Returns 1 on success, 0 if message not found.
+var markRetriedScript = redis.NewScript(`
+local msgKey = KEYS[1]
+local retriedSetKey = KEYS[2]
+local msgID = ARGV[1]
+local retriedAt = ARGV[2]
+
+-- Check message exists
+if redis.call('EXISTS', msgKey) == 0 then
+    return 0
+end
+
+-- Set retried_at field
+redis.call('HSET', msgKey, 'retried_at', retriedAt)
+
+-- Add to retried set
+redis.call('SADD', retriedSetKey, msgID)
+
+return 1
+`)
+
+// MarkRetried atomically marks a message as replayed using a Lua script.
+// The script checks existence, sets retried_at, and adds to the retried set
+// in a single atomic operation.
 func (s *RedisStore) MarkRetried(ctx context.Context, id string) error {
 	msgKey := s.msgPrefix + id
 
-	// Verify message exists
-	exists, err := s.client.Exists(ctx, msgKey).Result()
+	keys := []string{msgKey, s.retriedKey}
+	result, err := markRetriedScript.Run(ctx, s.client, keys, id, time.Now().Unix()).Int64()
 	if err != nil {
-		return fmt.Errorf("exists: %w", err)
+		return fmt.Errorf("mark retried script: %w", err)
 	}
-	if exists == 0 {
+
+	if result == 0 {
 		return fmt.Errorf("%s: %w", id, ErrNotFound)
-	}
-
-	// Update retried_at
-	if err := s.client.HSet(ctx, msgKey, "retried_at", time.Now().Unix()).Err(); err != nil {
-		return fmt.Errorf("hset: %w", err)
-	}
-
-	// Add to retried set
-	if err := s.client.SAdd(ctx, s.retriedKey, id).Err(); err != nil {
-		return fmt.Errorf("sadd retried: %w", err)
 	}
 
 	return nil
@@ -379,21 +460,29 @@ func (s *RedisStore) Delete(ctx context.Context, id string) error {
 
 	// Remove from stream using stored stream entry ID
 	if streamID := fields["stream_id"]; streamID != "" {
-		s.client.XDel(ctx, s.streamKey, streamID)
+		if err := s.client.XDel(ctx, s.streamKey, streamID).Err(); err != nil {
+			s.logger.Warn("failed to remove stream entry during delete", "id", id, "stream_id", streamID, "error", err)
+		}
 	}
 
 	// Remove from event index
 	if eventName := fields["event_name"]; eventName != "" {
 		eventKey := s.eventPrefix + eventName
-		s.client.SRem(ctx, eventKey, id)
+		if err := s.client.SRem(ctx, eventKey, id).Err(); err != nil {
+			s.logger.Warn("failed to remove event index during delete", "id", id, "event_name", eventName, "error", err)
+		}
 	}
 
 	// Remove from retried set
-	s.client.SRem(ctx, s.retriedKey, id)
+	if err := s.client.SRem(ctx, s.retriedKey, id).Err(); err != nil {
+		s.logger.Warn("failed to remove from retried set during delete", "id", id, "error", err)
+	}
 
 	// Remove reverse-lookup index by original ID
 	if originalID := fields["original_id"]; originalID != "" {
-		s.client.Del(ctx, s.originalPrefix+originalID)
+		if err := s.client.Del(ctx, s.originalPrefix+originalID).Err(); err != nil {
+			s.logger.Warn("failed to remove original ID index during delete", "id", id, "original_id", originalID, "error", err)
+		}
 	}
 
 	return nil
@@ -507,6 +596,50 @@ func (s *RedisStore) GetByOriginalID(ctx context.Context, originalID string) (*M
 	return s.Get(ctx, dlqID)
 }
 
+// Health performs a health check by pinging the Redis server.
+// Returns healthy if the ping succeeds, unhealthy otherwise.
+func (s *RedisStore) Health(ctx context.Context) *health.Result {
+	start := time.Now()
+
+	err := s.client.Ping(ctx).Err()
+	if err != nil {
+		return &health.Result{
+			Status:    health.StatusUnhealthy,
+			Message:   fmt.Sprintf("ping failed: %v", err),
+			Latency:   time.Since(start),
+			CheckedAt: start,
+			Details: map[string]any{
+				"stream_key": s.streamKey,
+			},
+		}
+	}
+
+	// Get message count from stream length
+	count, err := s.client.XLen(ctx, s.streamKey).Result()
+	if err != nil {
+		return &health.Result{
+			Status:    health.StatusUnhealthy,
+			Message:   fmt.Sprintf("xlen failed: %v", err),
+			Latency:   time.Since(start),
+			CheckedAt: start,
+			Details: map[string]any{
+				"stream_key": s.streamKey,
+			},
+		}
+	}
+
+	return &health.Result{
+		Status:    health.StatusHealthy,
+		Latency:   time.Since(start),
+		CheckedAt: start,
+		Details: map[string]any{
+			"stream_key":    s.streamKey,
+			"message_count": count,
+		},
+	}
+}
+
 // Compile-time checks
 var _ Store = (*RedisStore)(nil)
 var _ StatsProvider = (*RedisStore)(nil)
+var _ health.Checker = (*RedisStore)(nil)

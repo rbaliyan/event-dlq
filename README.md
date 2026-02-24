@@ -67,15 +67,15 @@ func handleMessage(ctx context.Context, msg Message) error {
     }
 
     // All retries exhausted - send to DLQ
-    return manager.Store(ctx,
-        "order.process",           // event name
-        msg.ID,                    // original message ID
-        msg.Payload,               // message payload
-        msg.Metadata,              // message metadata
-        errors.New("max retries"), // error that caused failure
-        maxRetries,                // retry count
-        "order-service",           // source service name
-    )
+    return manager.Store(ctx, dlq.StoreParams{
+        EventName:  "order.process",
+        OriginalID: msg.ID,
+        Payload:    msg.Payload,
+        Metadata:   msg.Metadata,
+        Err:        errors.New("max retries"),
+        RetryCount: maxRetries,
+        Source:     "order-service",
+    })
 }
 ```
 

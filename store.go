@@ -85,11 +85,6 @@ import (
 // will work for error checking.
 var ErrNotFound = fmt.Errorf("dlq message %w", eventerrors.ErrNotFound)
 
-// newNotFoundError creates a detailed not found error for a DLQ message.
-func newNotFoundError(id string) error {
-	return eventerrors.NewNotFoundError("dlq message", id)
-}
-
 // Message represents a message in the dead-letter queue.
 //
 // A DLQ message contains the original message data along with metadata

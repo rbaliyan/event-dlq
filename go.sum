@@ -35,8 +35,8 @@ github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZb
 github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
 github.com/rbaliyan/event-mongodb v0.1.0 h1:LMb7cRcVkHjhDyXXIjKhawTyqGjumoK/8AvFmlFG+6o=
 github.com/rbaliyan/event-mongodb v0.1.0/go.mod h1:9t5Ll3pIX81zyqJpE5fsTeohAb0hqbBH7V4OS9e2mNM=
-github.com/rbaliyan/event/v3 v3.15.0 h1:FFuem5ArSEweFwKEUmiZjzfhATDM4BU/FuJ8LI6ptxA=
-github.com/rbaliyan/event/v3 v3.15.0/go.mod h1:4/5e3rCCD5p2fBzbCnOGXe0xQR49jDdwIbI45j/VfYo=
+github.com/rbaliyan/event/v3 v3.15.1 h1:kq2j0YCqO0yP3B3ILYDdbRchvljDXCJDEXxB0NFGSHM=
+github.com/rbaliyan/event/v3 v3.15.1/go.mod h1:4/5e3rCCD5p2fBzbCnOGXe0xQR49jDdwIbI45j/VfYo=
 github.com/redis/go-redis/v9 v9.18.0 h1:pMkxYPkEbMPwRdenAzUNyFNrDgHx9U+DrBabWNfSRQs=
 github.com/redis/go-redis/v9 v9.18.0/go.mod h1:k3ufPphLU5YXwNTUcCRXGxUoF1fqxnhFQmscfkCoDA0=
 github.com/rogpeppe/go-internal v1.14.1 h1:UQB4HGPB6osV0SQTLymcB4TgvyWu6ZyliaW0tI/otEQ=

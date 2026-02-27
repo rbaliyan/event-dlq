@@ -8,8 +8,8 @@ require (
 	github.com/alicebob/miniredis/v2 v2.37.0
 	github.com/google/uuid v1.6.0
 	github.com/lib/pq v1.11.2
-	github.com/rbaliyan/event-mongodb v0.1.0
-	github.com/rbaliyan/event/v3 v3.15.1
+	github.com/rbaliyan/event-mongodb v0.5.0
+	github.com/rbaliyan/event/v3 v3.15.2
 	github.com/redis/go-redis/v9 v9.18.0
 	github.com/stretchr/testify v1.11.1
 	go.mongodb.org/mongo-driver/v2 v2.5.0

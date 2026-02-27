@@ -83,16 +83,24 @@ func main() {
 	// ============================================================
 
 	// 2a. Resume Token Store - persists position for crash recovery
-	resumeTokenStore := mongodb.NewMongoResumeTokenStore(
+	resumeTokenStore, err := mongodb.NewMongoResumeTokenStore(
 		internalDB.Collection("_resume_tokens"),
 	)
+	if err != nil {
+		logger.Error("failed to create resume token store", "error", err)
+		os.Exit(1)
+	}
 
 	// 2b. Ack Store - tracks which events have been acknowledged
-	ackStore := mongodb.NewMongoAckStore(
+	ackStore, err := mongodb.NewMongoAckStore(
 		internalDB.Collection("_event_acks"),
 		24*time.Hour, // TTL for acknowledged events
 	)
-	if err := ackStore.CreateIndexes(ctx); err != nil {
+	if err != nil {
+		logger.Error("failed to create ack store", "error", err)
+		os.Exit(1)
+	}
+	if err := ackStore.EnsureIndexes(ctx); err != nil {
 		logger.Error("failed to create ack store indexes", "error", err)
 		os.Exit(1)
 	}

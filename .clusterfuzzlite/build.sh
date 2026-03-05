@@ -1,0 +1,4 @@
+#!/bin/bash -eu
+compile_native_go_fuzzer github.com/rbaliyan/event-dlq FuzzMatchesFilter fuzz_matches_filter
+compile_native_go_fuzzer github.com/rbaliyan/event-dlq FuzzNormalizeErrorType fuzz_normalize_error_type
+compile_native_go_fuzzer github.com/rbaliyan/event-dlq FuzzStoreAndFilterMessages fuzz_store_and_filter_messages

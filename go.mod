@@ -6,7 +6,7 @@ require (
 	github.com/AdamKorcz/go-118-fuzz-build v0.0.0-20250520111509-a70c2aa677fa
 	github.com/alicebob/miniredis/v2 v2.37.0
 	github.com/google/uuid v1.6.0
-	github.com/lib/pq v1.11.2
+	github.com/lib/pq v1.12.0
 	github.com/rbaliyan/event-mongodb v0.5.1
 	github.com/rbaliyan/event/v3 v3.15.3
 	github.com/redis/go-redis/v9 v9.18.0

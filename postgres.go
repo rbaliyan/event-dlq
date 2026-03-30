@@ -135,6 +135,7 @@ func (s *PostgresStore) Store(ctx context.Context, msg *Message) error {
 		return fmt.Errorf("marshal metadata: %w", err)
 	}
 
+// #nosec G201 -- table name is set at construction, not user input
 	query := fmt.Sprintf(`
 		INSERT INTO %s (id, event_name, original_id, payload, metadata, error, retry_count, source, created_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
@@ -160,6 +161,7 @@ func (s *PostgresStore) Store(ctx context.Context, msg *Message) error {
 }
 
 // Get retrieves a single message by ID
+// #nosec G201 -- table name is set at construction, not user input
 func (s *PostgresStore) Get(ctx context.Context, id string) (*Message, error) {
 	query := fmt.Sprintf(`
 		SELECT id, event_name, original_id, payload, metadata, error, retry_count, source, created_at, retried_at
@@ -303,6 +305,7 @@ func (s *PostgresStore) buildListQuery(filter Filter, countOnly bool) (string, [
 	return baseQuery, args
 }
 
+// #nosec G201 -- table name is set at construction, not user input
 // MarkRetried marks a message as replayed
 func (s *PostgresStore) MarkRetried(ctx context.Context, id string) error {
 	query := fmt.Sprintf(`
@@ -326,8 +329,7 @@ func (s *PostgresStore) MarkRetried(ctx context.Context, id string) error {
 
 // Delete removes a message from the DLQ
 func (s *PostgresStore) Delete(ctx context.Context, id string) error {
-	query := fmt.Sprintf("DELETE FROM %s WHERE id = $1", s.table)
-
+	query := fmt.Sprintf("DELETE FROM %s WHERE id = $1", s.table) // #nosec G201 -- table name is set at construction, not user input
 	result, err := s.db.ExecContext(ctx, query, id)
 	if err != nil {
 		return fmt.Errorf("delete: %w", err)
@@ -343,8 +345,7 @@ func (s *PostgresStore) Delete(ctx context.Context, id string) error {
 
 // DeleteOlderThan removes messages older than the specified age
 func (s *PostgresStore) DeleteOlderThan(ctx context.Context, age time.Duration) (int64, error) {
-	query := fmt.Sprintf("DELETE FROM %s WHERE created_at < $1", s.table)
-
+	query := fmt.Sprintf("DELETE FROM %s WHERE created_at < $1", s.table) // #nosec G201 -- table name is set at construction, not user input
 	result, err := s.db.ExecContext(ctx, query, time.Now().Add(-age))
 	if err != nil {
 		return 0, fmt.Errorf("delete: %w", err)
@@ -433,6 +434,7 @@ func (s *PostgresStore) Stats(ctx context.Context) (*Stats, error) {
 
 // GetByOriginalID retrieves a message by its original event message ID
 func (s *PostgresStore) GetByOriginalID(ctx context.Context, originalID string) (*Message, error) {
+	// #nosec G201 -- table name is set at construction, not user input
 	query := fmt.Sprintf(`
 		SELECT id, event_name, original_id, payload, metadata, error, retry_count, source, created_at, retried_at
 		FROM %s

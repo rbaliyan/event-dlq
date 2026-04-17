@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
@@ -146,9 +147,15 @@ func NewMongoStore(db *mongo.Database, opts ...MongoStoreOption) (*MongoStore, e
 		opt(o)
 	}
 
-	return &MongoStore{
+	s := &MongoStore{
 		collection: db.Collection(o.collection),
-	}, nil
+	}
+	go func() { // #nosec G118 — background goroutine intentionally outlives constructor context
+		if err := s.EnsureIndexes(context.Background()); err != nil {
+			slog.Default().Error("failed to ensure DLQ indexes", "error", err, "collection", o.collection)
+		}
+	}()
+	return s, nil
 }
 
 // Collection returns the underlying MongoDB collection

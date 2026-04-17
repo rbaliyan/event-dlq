@@ -7,11 +7,11 @@ require (
 	github.com/alicebob/miniredis/v2 v2.37.0
 	github.com/google/uuid v1.6.0
 	github.com/lib/pq v1.12.3
-	github.com/rbaliyan/event-mongodb v0.6.0
-	github.com/rbaliyan/event/v3 v3.15.8
+	github.com/rbaliyan/event-mongodb v0.6.2
+	github.com/rbaliyan/event/v3 v3.15.11
 	github.com/redis/go-redis/v9 v9.18.0
 	github.com/stretchr/testify v1.11.1
-	go.mongodb.org/mongo-driver/v2 v2.5.0
+	go.mongodb.org/mongo-driver/v2 v2.5.1
 	go.opentelemetry.io/otel v1.43.0
 	go.opentelemetry.io/otel/metric v1.43.0
 )

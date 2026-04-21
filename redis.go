@@ -14,25 +14,23 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// storeScript atomically stores a DLQ message in Redis using a Lua script.
-// This ensures the hash, stream entry, stream_id back-reference, and event index
-// are all written together or not at all.
+// storeScript atomically stores a DLQ message in Redis.
 //
 // KEYS[1] = message hash key (dlq:msg:{id})
-// KEYS[2] = stream key (dlq:messages)
+// KEYS[2] = time index key (dlq:by_time)
 // KEYS[3] = event index key (dlq:by_event:{event_name})
 //
 // ARGV[1]  = number of hash field-value pairs (N)
 // ARGV[2..2*N+1] = hash field-value pairs
-// ARGV[2*N+2] = maxLen (0 means no limit)
-// ARGV[2*N+3] = message ID (for the stream entry value)
+// ARGV[2*N+2] = score (created_at unix timestamp)
+// ARGV[2*N+3] = message ID
 var storeScript = redis.NewScript(`
 local hashKey = KEYS[1]
-local streamKey = KEYS[2]
-local eventIndexKey = KEYS[3]
+local timeKey = KEYS[2]
+local eventKey = KEYS[3]
 
 local numFields = tonumber(ARGV[1])
-local maxLen = tonumber(ARGV[numFields * 2 + 2])
+local score = tonumber(ARGV[numFields * 2 + 2])
 local msgID = ARGV[numFields * 2 + 3]
 
 -- HSet message hash
@@ -42,43 +40,43 @@ for i = 1, numFields * 2 do
 end
 redis.call('HSET', hashKey, unpack(hashArgs))
 
--- XAdd to stream
-local streamID
-if maxLen > 0 then
-    streamID = redis.call('XADD', streamKey, 'MAXLEN', '~', tostring(maxLen), '*', 'id', msgID)
-else
-    streamID = redis.call('XADD', streamKey, '*', 'id', msgID)
-end
+-- Add to time index (primary sorted set for time-range queries)
+redis.call('ZADD', timeKey, score, msgID)
 
--- Store stream entry ID back in hash
-redis.call('HSET', hashKey, 'stream_id', streamID)
+-- Add to event index (per-event sorted set for event+time queries)
+redis.call('ZADD', eventKey, score, msgID)
 
--- Add to event index
-redis.call('SADD', eventIndexKey, msgID)
-
-return streamID
+return 1
 `)
 
 /*
 Redis Schema:
 
-Uses Redis Streams and Hashes for DLQ:
-- Stream: dlq:messages - all DLQ messages
-- Hash: dlq:msg:{id} - individual message details
-- Set: dlq:by_event:{event_name} - message IDs by event
-- Set: dlq:retried - IDs of retried messages
+Key layout:
+  dlq:by_time             sorted set  score=created_at_unix  member=msgID
+  dlq:by_event:{name}     sorted set  score=created_at_unix  member=msgID
+  dlq:msg:{id}            hash        message fields
+  dlq:retried             set         retried msgIDs
+  dlq:by_original:{id}    string      → msgID
 */
 
-// RedisStore is a Redis-based DLQ store
+// RedisStore is a Redis-based DLQ store.
+//
+// All messages are indexed by creation time in a sorted set (dlq:by_time),
+// enabling O(log N + M) time-range queries via ZRANGEBYSCORE rather than
+// O(N) stream scans. Per-event sorted sets (dlq:by_event:{name}) allow
+// combined event+time queries at the same complexity.
+//
+// Filters that cannot be pushed to Redis (Source, Error contains, MaxRetries,
+// ExcludeRetried) are applied in-memory after the initial sorted-set lookup.
 type RedisStore struct {
 	client         redis.Cmdable
 	logger         *slog.Logger
-	streamKey      string
-	msgPrefix      string
-	eventPrefix    string
-	retriedKey     string
-	originalPrefix string
-	maxLen         int64
+	timeKey        string // dlq:by_time — primary sorted set
+	msgPrefix      string // dlq:msg:
+	eventPrefix    string // dlq:by_event:
+	retriedKey     string // dlq:retried
+	originalPrefix string // dlq:by_original:
 }
 
 // RedisStoreOption configures a RedisStore.
@@ -86,7 +84,6 @@ type RedisStoreOption func(*redisStoreOptions)
 
 type redisStoreOptions struct {
 	keyPrefix string
-	maxLen    int64
 	logger    *slog.Logger
 }
 
@@ -104,15 +101,6 @@ func WithRedisLogger(logger *slog.Logger) RedisStoreOption {
 	return func(o *redisStoreOptions) {
 		if logger != nil {
 			o.logger = logger
-		}
-	}
-}
-
-// WithMaxLen sets the maximum stream length.
-func WithMaxLen(maxLen int64) RedisStoreOption {
-	return func(o *redisStoreOptions) {
-		if maxLen > 0 {
-			o.maxLen = maxLen
 		}
 	}
 }
@@ -138,20 +126,18 @@ func NewRedisStore(client redis.Cmdable, opts ...RedisStoreOption) (*RedisStore,
 	return &RedisStore{
 		client:         client,
 		logger:         logger,
-		streamKey:      o.keyPrefix + "messages",
+		timeKey:        o.keyPrefix + "by_time",
 		msgPrefix:      o.keyPrefix + "msg:",
 		eventPrefix:    o.keyPrefix + "by_event:",
 		retriedKey:     o.keyPrefix + "retried",
 		originalPrefix: o.keyPrefix + "by_original:",
-		maxLen:         o.maxLen,
 	}, nil
 }
 
 // Store adds a message to the DLQ.
-// The core operations (hash, stream, stream_id back-reference, event index)
-// are executed atomically via a Lua script. The optional reverse-lookup index
-// by original ID is written separately since its failure should not roll back
-// the main store operation.
+// The core operations (hash write, time index, event index) are executed
+// atomically via a Lua script. The optional reverse-lookup index by original
+// ID is written separately.
 func (s *RedisStore) Store(ctx context.Context, msg *Message) error {
 	if msg == nil {
 		return fmt.Errorf("message is nil")
@@ -163,8 +149,8 @@ func (s *RedisStore) Store(ctx context.Context, msg *Message) error {
 	msgKey := s.msgPrefix + msg.ID
 	eventKey := s.eventPrefix + msg.EventName
 	metadata, _ := json.Marshal(msg.Metadata)
+	score := msg.CreatedAt.Unix()
 
-	// Build flat field-value pairs for the Lua script
 	fieldPairs := []interface{}{
 		"id", msg.ID,
 		"event_name", msg.EventName,
@@ -174,31 +160,24 @@ func (s *RedisStore) Store(ctx context.Context, msg *Message) error {
 		"error", msg.Error,
 		"retry_count", msg.RetryCount,
 		"source", msg.Source,
-		"created_at", msg.CreatedAt.Unix(),
+		"created_at", score,
 	}
 
-	const numFields = 9 // number of key-value pairs in fieldPairs
+	const numFields = 9
 
-	// ARGV: [numFields, field1, val1, field2, val2, ..., maxLen, msgID]
 	argv := make([]interface{}, 0, numFields*2+3)
 	argv = append(argv, numFields)
 	argv = append(argv, fieldPairs...)
-	argv = append(argv, s.maxLen)
+	argv = append(argv, score)
 	argv = append(argv, msg.ID)
 
-	keys := []string{msgKey, s.streamKey, eventKey}
-
-	_, err := storeScript.Run(ctx, s.client, keys, argv...).Result()
+	_, err := storeScript.Run(ctx, s.client, []string{msgKey, s.timeKey, eventKey}, argv...).Result()
 	if err != nil {
 		return fmt.Errorf("store script: %w", err)
 	}
 
-	// Add reverse-lookup index by original ID (separate concern).
-	// The core data is already committed via the Lua script above,
-	// so we log a warning instead of returning an error.
 	if msg.OriginalID != "" {
-		originalKey := s.originalPrefix + msg.OriginalID
-		if err := s.client.Set(ctx, originalKey, msg.ID, 0).Err(); err != nil {
+		if err := s.client.Set(ctx, s.originalPrefix+msg.OriginalID, msg.ID, 0).Err(); err != nil {
 			s.logger.Warn("failed to set original ID index",
 				"original_id", msg.OriginalID,
 				"message_id", msg.ID,
@@ -209,11 +188,9 @@ func (s *RedisStore) Store(ctx context.Context, msg *Message) error {
 	return nil
 }
 
-// Get retrieves a single message by ID
+// Get retrieves a single message by ID.
 func (s *RedisStore) Get(ctx context.Context, id string) (*Message, error) {
-	msgKey := s.msgPrefix + id
-
-	fields, err := s.client.HGetAll(ctx, msgKey).Result()
+	fields, err := s.client.HGetAll(ctx, s.msgPrefix+id).Result()
 	if err != nil {
 		return nil, fmt.Errorf("hgetall: %w", err)
 	}
@@ -225,7 +202,7 @@ func (s *RedisStore) Get(ctx context.Context, id string) (*Message, error) {
 	return s.parseMessage(fields)
 }
 
-// parseMessage converts hash fields to Message
+// parseMessage converts hash fields to Message.
 func (s *RedisStore) parseMessage(fields map[string]string) (*Message, error) {
 	msg := &Message{
 		ID:         fields["id"],
@@ -270,36 +247,40 @@ func (s *RedisStore) parseMessage(fields map[string]string) (*Message, error) {
 	return msg, nil
 }
 
-// List returns messages matching the filter
-func (s *RedisStore) List(ctx context.Context, filter Filter) ([]*Message, error) {
-	var ids []string
+// timeRange builds ZRangeBy min/max from filter time bounds.
+func timeRange(filter Filter) *redis.ZRangeBy {
+	r := &redis.ZRangeBy{Min: "-inf", Max: "+inf"}
+	if !filter.StartTime.IsZero() {
+		r.Min = strconv.FormatInt(filter.StartTime.Unix(), 10)
+	}
+	if !filter.EndTime.IsZero() {
+		r.Max = strconv.FormatInt(filter.EndTime.Unix(), 10)
+	}
+	return r
+}
 
+// List returns messages matching the filter.
+//
+// Time bounds (StartTime, EndTime) are pushed to Redis via ZRANGEBYSCORE for
+// O(log N + M) retrieval. EventName selects the per-event sorted set.
+// Remaining filters (Source, Error, MaxRetries, ExcludeRetried) are applied
+// in-memory after the bulk fetch.
+func (s *RedisStore) List(ctx context.Context, filter Filter) ([]*Message, error) {
+	key := s.timeKey
 	if filter.EventName != "" {
-		// Get IDs from event index
-		eventKey := s.eventPrefix + filter.EventName
-		var err error
-		ids, err = s.client.SMembers(ctx, eventKey).Result()
-		if err != nil {
-			return nil, fmt.Errorf("smembers: %w", err)
-		}
-	} else {
-		// Get all IDs from stream
-		results, err := s.client.XRange(ctx, s.streamKey, "-", "+").Result()
-		if err != nil {
-			return nil, fmt.Errorf("xrange: %w", err)
-		}
-		for _, r := range results {
-			if id, ok := r.Values["id"].(string); ok {
-				ids = append(ids, id)
-			}
-		}
+		key = s.eventPrefix + filter.EventName
 	}
 
-	// Batch-fetch all messages using pipeline to avoid N round-trips
+	ids, err := s.client.ZRangeByScore(ctx, key, timeRange(filter)).Result()
+	if err != nil {
+		return nil, fmt.Errorf("zrangebyscore: %w", err)
+	}
+
 	if len(ids) == 0 {
 		return nil, nil
 	}
 
+	// Batch-fetch all message hashes in one pipeline.
 	pipe := s.client.Pipeline()
 	cmds := make([]*redis.MapStringStringCmd, len(ids))
 	for i, id := range ids {
@@ -309,27 +290,18 @@ func (s *RedisStore) List(ctx context.Context, filter Filter) ([]*Message, error
 		return nil, fmt.Errorf("pipeline hgetall: %w", err)
 	}
 
-	// Parse results and apply filters
+	// Parse and apply in-memory filters.
 	var messages []*Message
 	for _, cmd := range cmds {
 		fields, err := cmd.Result()
 		if err != nil || len(fields) == 0 {
 			continue
 		}
-
 		msg, err := s.parseMessage(fields)
 		if err != nil {
 			continue
 		}
-
-		// Apply filters
 		if filter.ExcludeRetried && msg.RetriedAt != nil {
-			continue
-		}
-		if !filter.StartTime.IsZero() && msg.CreatedAt.Before(filter.StartTime) {
-			continue
-		}
-		if !filter.EndTime.IsZero() && msg.CreatedAt.After(filter.EndTime) {
 			continue
 		}
 		if filter.MaxRetries > 0 && msg.RetryCount > filter.MaxRetries {
@@ -341,19 +313,15 @@ func (s *RedisStore) List(ctx context.Context, filter Filter) ([]*Message, error
 		if filter.Error != "" && !strings.Contains(strings.ToLower(msg.Error), strings.ToLower(filter.Error)) {
 			continue
 		}
-
 		messages = append(messages, msg)
 	}
 
-	// Apply offset after filtering
 	if filter.Offset > 0 {
 		if filter.Offset >= len(messages) {
 			return nil, nil
 		}
 		messages = messages[filter.Offset:]
 	}
-
-	// Apply limit after filtering
 	if filter.Limit > 0 && len(messages) > filter.Limit {
 		messages = messages[:filter.Limit]
 	}
@@ -362,25 +330,25 @@ func (s *RedisStore) List(ctx context.Context, filter Filter) ([]*Message, error
 }
 
 // Count returns the number of messages matching the filter.
-// When only EventName (or no filter) is set, uses efficient Redis counting.
-// For complex filters, falls back to listing and counting matched messages.
+//
+// When no in-memory-only filters are active, uses ZCOUNT for O(log N) counting.
+// Falls back to listing and counting when Source, Error, MaxRetries, or
+// ExcludeRetried filters are present.
 func (s *RedisStore) Count(ctx context.Context, filter Filter) (int64, error) {
 	hasComplexFilters := filter.ExcludeRetried ||
-		!filter.StartTime.IsZero() ||
-		!filter.EndTime.IsZero() ||
 		filter.MaxRetries > 0 ||
 		filter.Source != "" ||
 		filter.Error != ""
 
 	if !hasComplexFilters {
+		r := timeRange(filter)
+		key := s.timeKey
 		if filter.EventName != "" {
-			eventKey := s.eventPrefix + filter.EventName
-			return s.client.SCard(ctx, eventKey).Result()
+			key = s.eventPrefix + filter.EventName
 		}
-		return s.client.XLen(ctx, s.streamKey).Result()
+		return s.client.ZCount(ctx, key, r.Min, r.Max).Result()
 	}
 
-	// For complex filters, list and count all matching messages
 	countFilter := filter
 	countFilter.Offset = 0
 	countFilter.Limit = 0
@@ -392,7 +360,6 @@ func (s *RedisStore) Count(ctx context.Context, filter Filter) (int64, error) {
 }
 
 // markRetriedScript atomically marks a DLQ message as retried.
-// It checks the message exists, sets retried_at, and adds to the retried set.
 //
 // KEYS[1] = message hash key (dlq:msg:{id})
 // KEYS[2] = retried set key (dlq:retried)
@@ -407,44 +374,35 @@ local retriedSetKey = KEYS[2]
 local msgID = ARGV[1]
 local retriedAt = ARGV[2]
 
--- Check message exists
 if redis.call('EXISTS', msgKey) == 0 then
     return 0
 end
 
--- Set retried_at field
 redis.call('HSET', msgKey, 'retried_at', retriedAt)
-
--- Add to retried set
 redis.call('SADD', retriedSetKey, msgID)
 
 return 1
 `)
 
-// MarkRetried atomically marks a message as replayed using a Lua script.
-// The script checks existence, sets retried_at, and adds to the retried set
-// in a single atomic operation.
+// MarkRetried atomically marks a message as replayed.
 func (s *RedisStore) MarkRetried(ctx context.Context, id string) error {
-	msgKey := s.msgPrefix + id
-
-	keys := []string{msgKey, s.retriedKey}
-	result, err := markRetriedScript.Run(ctx, s.client, keys, id, time.Now().Unix()).Int64()
+	result, err := markRetriedScript.Run(ctx, s.client,
+		[]string{s.msgPrefix + id, s.retriedKey},
+		id, time.Now().Unix(),
+	).Int64()
 	if err != nil {
 		return fmt.Errorf("mark retried script: %w", err)
 	}
-
 	if result == 0 {
 		return fmt.Errorf("%s: %w", id, ErrNotFound)
 	}
-
 	return nil
 }
 
-// Delete removes a message from the DLQ
+// Delete removes a message from the DLQ and all its index entries.
 func (s *RedisStore) Delete(ctx context.Context, id string) error {
 	msgKey := s.msgPrefix + id
 
-	// Get message details needed for cleanup
 	fields, err := s.client.HGetAll(ctx, msgKey).Result()
 	if err != nil {
 		return fmt.Errorf("hgetall: %w", err)
@@ -453,32 +411,24 @@ func (s *RedisStore) Delete(ctx context.Context, id string) error {
 		return fmt.Errorf("%s: %w", id, ErrNotFound)
 	}
 
-	// Delete hash
 	if err := s.client.Del(ctx, msgKey).Err(); err != nil {
 		return fmt.Errorf("del: %w", err)
 	}
 
-	// Remove from stream using stored stream entry ID
-	if streamID := fields["stream_id"]; streamID != "" {
-		if err := s.client.XDel(ctx, s.streamKey, streamID).Err(); err != nil {
-			s.logger.Warn("failed to remove stream entry during delete", "id", id, "stream_id", streamID, "error", err)
-		}
+	if err := s.client.ZRem(ctx, s.timeKey, id).Err(); err != nil {
+		s.logger.Warn("failed to remove from time index during delete", "id", id, "error", err)
 	}
 
-	// Remove from event index
 	if eventName := fields["event_name"]; eventName != "" {
-		eventKey := s.eventPrefix + eventName
-		if err := s.client.SRem(ctx, eventKey, id).Err(); err != nil {
+		if err := s.client.ZRem(ctx, s.eventPrefix+eventName, id).Err(); err != nil {
 			s.logger.Warn("failed to remove event index during delete", "id", id, "event_name", eventName, "error", err)
 		}
 	}
 
-	// Remove from retried set
 	if err := s.client.SRem(ctx, s.retriedKey, id).Err(); err != nil {
 		s.logger.Warn("failed to remove from retried set during delete", "id", id, "error", err)
 	}
 
-	// Remove reverse-lookup index by original ID
 	if originalID := fields["original_id"]; originalID != "" {
 		if err := s.client.Del(ctx, s.originalPrefix+originalID).Err(); err != nil {
 			s.logger.Warn("failed to remove original ID index during delete", "id", id, "original_id", originalID, "error", err)
@@ -488,44 +438,30 @@ func (s *RedisStore) Delete(ctx context.Context, id string) error {
 	return nil
 }
 
-// DeleteOlderThan removes messages older than the specified age
+// DeleteOlderThan removes messages older than the specified age.
+// Uses ZRANGEBYSCORE on the time index for O(log N + M) retrieval instead of
+// a full SCAN over all message keys.
 func (s *RedisStore) DeleteOlderThan(ctx context.Context, age time.Duration) (int64, error) {
-	cutoff := time.Now().Add(-age).Unix()
+	cutoff := strconv.FormatInt(time.Now().Add(-age).Unix(), 10)
 
-	// Scan all message keys
-	var cursor uint64
-	var deleted int64
-
-	for {
-		keys, nextCursor, err := s.client.Scan(ctx, cursor, s.msgPrefix+"*", 100).Result()
-		if err != nil {
-			return deleted, fmt.Errorf("scan: %w", err)
-		}
-
-		for _, key := range keys {
-			createdAt, err := s.client.HGet(ctx, key, "created_at").Int64()
-			if err != nil {
-				continue
-			}
-
-			if createdAt < cutoff {
-				id := key[len(s.msgPrefix):]
-				if err := s.Delete(ctx, id); err == nil {
-					deleted++
-				}
-			}
-		}
-
-		cursor = nextCursor
-		if cursor == 0 {
-			break
-		}
+	ids, err := s.client.ZRangeByScore(ctx, s.timeKey, &redis.ZRangeBy{
+		Min: "-inf",
+		Max: cutoff,
+	}).Result()
+	if err != nil {
+		return 0, fmt.Errorf("zrangebyscore: %w", err)
 	}
 
+	var deleted int64
+	for _, id := range ids {
+		if err := s.Delete(ctx, id); err == nil {
+			deleted++
+		}
+	}
 	return deleted, nil
 }
 
-// DeleteByFilter removes messages matching the filter
+// DeleteByFilter removes messages matching the filter.
 func (s *RedisStore) DeleteByFilter(ctx context.Context, filter Filter) (int64, error) {
 	messages, err := s.List(ctx, filter)
 	if err != nil {
@@ -538,40 +474,35 @@ func (s *RedisStore) DeleteByFilter(ctx context.Context, filter Filter) (int64, 
 			deleted++
 		}
 	}
-
 	return deleted, nil
 }
 
-// Stats returns DLQ statistics
+// Stats returns DLQ statistics.
 func (s *RedisStore) Stats(ctx context.Context) (*Stats, error) {
 	stats := &Stats{
 		MessagesByEvent: make(map[string]int64),
 		MessagesByError: make(map[string]int64),
 	}
 
-	// Total count
-	total, _ := s.client.XLen(ctx, s.streamKey).Result()
+	total, _ := s.client.ZCard(ctx, s.timeKey).Result()
 	stats.TotalMessages = total
 
-	// Retried count
 	retried, _ := s.client.SCard(ctx, s.retriedKey).Result()
 	stats.RetriedMessages = retried
 	stats.PendingMessages = total - retried
 
-	// Count by event - scan event index keys
+	// Enumerate event names via SCAN; ZCard each event sorted set.
 	var cursor uint64
 	for {
 		keys, nextCursor, err := s.client.Scan(ctx, cursor, s.eventPrefix+"*", 100).Result()
 		if err != nil {
 			break
 		}
-
 		for _, key := range keys {
 			eventName := key[len(s.eventPrefix):]
-			count, _ := s.client.SCard(ctx, key).Result()
+			count, _ := s.client.ZCard(ctx, key).Result()
 			stats.MessagesByEvent[eventName] = count
 		}
-
 		cursor = nextCursor
 		if cursor == 0 {
 			break
@@ -581,49 +512,43 @@ func (s *RedisStore) Stats(ctx context.Context) (*Stats, error) {
 	return stats, nil
 }
 
-// GetByOriginalID retrieves a message by its original event message ID
+// GetByOriginalID retrieves a message by its original event message ID.
 func (s *RedisStore) GetByOriginalID(ctx context.Context, originalID string) (*Message, error) {
-	// Look up the DLQ message ID from the reverse index
-	originalKey := s.originalPrefix + originalID
-	dlqID, err := s.client.Get(ctx, originalKey).Result()
+	dlqID, err := s.client.Get(ctx, s.originalPrefix+originalID).Result()
 	if err != nil {
 		if errors.Is(err, redis.Nil) {
 			return nil, fmt.Errorf("original_id %s: %w", originalID, ErrNotFound)
 		}
 		return nil, fmt.Errorf("get original index: %w", err)
 	}
-
 	return s.Get(ctx, dlqID)
 }
 
 // Health performs a health check by pinging the Redis server.
-// Returns healthy if the ping succeeds, unhealthy otherwise.
 func (s *RedisStore) Health(ctx context.Context) *health.Result {
 	start := time.Now()
 
-	err := s.client.Ping(ctx).Err()
-	if err != nil {
+	if err := s.client.Ping(ctx).Err(); err != nil {
 		return &health.Result{
 			Status:    health.StatusUnhealthy,
 			Message:   fmt.Sprintf("ping failed: %v", err),
 			Latency:   time.Since(start),
 			CheckedAt: start,
 			Details: map[string]any{
-				"stream_key": s.streamKey,
+				"time_key": s.timeKey,
 			},
 		}
 	}
 
-	// Get message count from stream length
-	count, err := s.client.XLen(ctx, s.streamKey).Result()
+	count, err := s.client.ZCard(ctx, s.timeKey).Result()
 	if err != nil {
 		return &health.Result{
 			Status:    health.StatusUnhealthy,
-			Message:   fmt.Sprintf("xlen failed: %v", err),
+			Message:   fmt.Sprintf("zcard failed: %v", err),
 			Latency:   time.Since(start),
 			CheckedAt: start,
 			Details: map[string]any{
-				"stream_key": s.streamKey,
+				"time_key": s.timeKey,
 			},
 		}
 	}
@@ -633,7 +558,7 @@ func (s *RedisStore) Health(ctx context.Context) *health.Result {
 		Latency:   time.Since(start),
 		CheckedAt: start,
 		Details: map[string]any{
-			"stream_key":    s.streamKey,
+			"time_key":      s.timeKey,
 			"message_count": count,
 		},
 	}

@@ -45,7 +45,6 @@ func TestRedisStore_Store(t *testing.T) {
 	err := store.Store(ctx, msg)
 	require.NoError(t, err)
 
-	// Verify the message can be retrieved
 	retrieved, err := store.Get(ctx, "dlq-1")
 	require.NoError(t, err)
 	assert.Equal(t, "dlq-1", retrieved.ID)
@@ -101,7 +100,6 @@ func TestRedisStore_Get(t *testing.T) {
 	assert.Equal(t, msg.Error, retrieved.Error)
 	assert.Equal(t, msg.RetryCount, retrieved.RetryCount)
 	assert.Equal(t, msg.Source, retrieved.Source)
-	// Redis stores unix timestamps, so compare at second granularity
 	assert.Equal(t, msg.CreatedAt.Unix(), retrieved.CreatedAt.Unix())
 	assert.Nil(t, retrieved.RetriedAt)
 }
@@ -119,12 +117,11 @@ func TestRedisStore_List(t *testing.T) {
 	store, _ := setupRedisStore(t)
 	ctx := context.Background()
 
-	// Store messages with different event names
-	now := time.Now()
+	now := time.Now().Truncate(time.Second)
 	msgs := []*Message{
-		{ID: "dlq-list-1", EventName: "order.created", OriginalID: "o1", Payload: []byte("p1"), Error: "err1", CreatedAt: now, Source: "svc-a"},
-		{ID: "dlq-list-2", EventName: "order.updated", OriginalID: "o2", Payload: []byte("p2"), Error: "err2", CreatedAt: now, Source: "svc-b"},
-		{ID: "dlq-list-3", EventName: "order.created", OriginalID: "o3", Payload: []byte("p3"), Error: "err3", CreatedAt: now, Source: "svc-a"},
+		{ID: "dlq-list-1", EventName: "order.created", OriginalID: "o1", Payload: []byte("p1"), Error: "err1", CreatedAt: now, Source: "svc-a", RetryCount: 1},
+		{ID: "dlq-list-2", EventName: "order.updated", OriginalID: "o2", Payload: []byte("p2"), Error: "err2", CreatedAt: now, Source: "svc-b", RetryCount: 2},
+		{ID: "dlq-list-3", EventName: "order.created", OriginalID: "o3", Payload: []byte("p3"), Error: "err3", CreatedAt: now, Source: "svc-a", RetryCount: 5},
 	}
 	for _, m := range msgs {
 		require.NoError(t, store.Store(ctx, m))
@@ -152,8 +149,23 @@ func TestRedisStore_List(t *testing.T) {
 		assert.Equal(t, "dlq-list-2", results[0].ID)
 	})
 
+	t.Run("filter by max retries", func(t *testing.T) {
+		results, err := store.List(ctx, Filter{MaxRetries: 2})
+		require.NoError(t, err)
+		assert.Len(t, results, 2)
+		for _, r := range results {
+			assert.LessOrEqual(t, r.RetryCount, 2)
+		}
+	})
+
+	t.Run("filter by error contains", func(t *testing.T) {
+		results, err := store.List(ctx, Filter{Error: "ERR2"}) // case-insensitive
+		require.NoError(t, err)
+		assert.Len(t, results, 1)
+		assert.Equal(t, "dlq-list-2", results[0].ID)
+	})
+
 	t.Run("filter exclude retried", func(t *testing.T) {
-		// Mark one as retried
 		require.NoError(t, store.MarkRetried(ctx, "dlq-list-1"))
 
 		results, err := store.List(ctx, Filter{ExcludeRetried: true})
@@ -177,6 +189,59 @@ func TestRedisStore_List(t *testing.T) {
 	})
 }
 
+func TestRedisStore_List_TimeFilter(t *testing.T) {
+	store, _ := setupRedisStore(t)
+	ctx := context.Background()
+
+	base := time.Now().Truncate(time.Second)
+	msgs := []*Message{
+		{ID: "tf-old", EventName: "order.created", Payload: []byte("p"), Error: "e", CreatedAt: base.Add(-2 * time.Hour)},
+		{ID: "tf-mid", EventName: "order.created", Payload: []byte("p"), Error: "e", CreatedAt: base.Add(-1 * time.Hour)},
+		{ID: "tf-new", EventName: "order.created", Payload: []byte("p"), Error: "e", CreatedAt: base},
+	}
+	for _, m := range msgs {
+		require.NoError(t, store.Store(ctx, m))
+	}
+
+	t.Run("start time excludes old", func(t *testing.T) {
+		results, err := store.List(ctx, Filter{StartTime: base.Add(-90 * time.Minute)})
+		require.NoError(t, err)
+		assert.Len(t, results, 2)
+		ids := make([]string, len(results))
+		for i, r := range results {
+			ids[i] = r.ID
+		}
+		assert.Contains(t, ids, "tf-mid")
+		assert.Contains(t, ids, "tf-new")
+	})
+
+	t.Run("end time excludes new", func(t *testing.T) {
+		results, err := store.List(ctx, Filter{EndTime: base.Add(-90 * time.Minute)})
+		require.NoError(t, err)
+		assert.Len(t, results, 1)
+		assert.Equal(t, "tf-old", results[0].ID)
+	})
+
+	t.Run("start and end time", func(t *testing.T) {
+		results, err := store.List(ctx, Filter{
+			StartTime: base.Add(-90 * time.Minute),
+			EndTime:   base.Add(-30 * time.Minute),
+		})
+		require.NoError(t, err)
+		assert.Len(t, results, 1)
+		assert.Equal(t, "tf-mid", results[0].ID)
+	})
+
+	t.Run("event name with time filter", func(t *testing.T) {
+		results, err := store.List(ctx, Filter{
+			EventName: "order.created",
+			StartTime: base.Add(-90 * time.Minute),
+		})
+		require.NoError(t, err)
+		assert.Len(t, results, 2)
+	})
+}
+
 func TestRedisStore_Delete(t *testing.T) {
 	store, _ := setupRedisStore(t)
 	ctx := context.Background()
@@ -184,20 +249,16 @@ func TestRedisStore_Delete(t *testing.T) {
 	msg := newRedisMessage("dlq-del-1", "order.created")
 	require.NoError(t, store.Store(ctx, msg))
 
-	// Verify it exists
 	_, err := store.Get(ctx, "dlq-del-1")
 	require.NoError(t, err)
 
-	// Delete it
 	err = store.Delete(ctx, "dlq-del-1")
 	require.NoError(t, err)
 
-	// Verify it is gone
 	_, err = store.Get(ctx, "dlq-del-1")
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, ErrNotFound))
 
-	// Delete non-existent returns error
 	err = store.Delete(ctx, "non-existent")
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, ErrNotFound))
@@ -210,33 +271,28 @@ func TestRedisStore_MarkRetried(t *testing.T) {
 	msg := newRedisMessage("dlq-retry-1", "order.created")
 	require.NoError(t, store.Store(ctx, msg))
 
-	// Verify not yet retried
 	retrieved, err := store.Get(ctx, "dlq-retry-1")
 	require.NoError(t, err)
 	assert.Nil(t, retrieved.RetriedAt)
 
-	// Mark as retried
 	err = store.MarkRetried(ctx, "dlq-retry-1")
 	require.NoError(t, err)
 
-	// Verify retried_at is set
 	retrieved, err = store.Get(ctx, "dlq-retry-1")
 	require.NoError(t, err)
 	assert.NotNil(t, retrieved.RetriedAt)
 
-	// Mark non-existent returns error
 	err = store.MarkRetried(ctx, "non-existent")
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, ErrNotFound))
 }
 
 func TestRedisStore_DeleteOlderThan(t *testing.T) {
-	store, mr := setupRedisStore(t)
+	store, _ := setupRedisStore(t)
 	ctx := context.Background()
 
 	now := time.Now()
 
-	// Store an old message (2 hours ago)
 	oldMsg := &Message{
 		ID:        "dlq-old",
 		EventName: "order.created",
@@ -246,7 +302,6 @@ func TestRedisStore_DeleteOlderThan(t *testing.T) {
 	}
 	require.NoError(t, store.Store(ctx, oldMsg))
 
-	// Store a new message (now)
 	newMsg := &Message{
 		ID:        "dlq-new",
 		EventName: "order.created",
@@ -256,19 +311,13 @@ func TestRedisStore_DeleteOlderThan(t *testing.T) {
 	}
 	require.NoError(t, store.Store(ctx, newMsg))
 
-	// Fast-forward miniredis time isn't needed since we set created_at directly
-	_ = mr
-
-	// Delete messages older than 90 minutes
 	deleted, err := store.DeleteOlderThan(ctx, 90*time.Minute)
 	require.NoError(t, err)
 	assert.Equal(t, int64(1), deleted)
 
-	// Verify the new message still exists
 	_, err = store.Get(ctx, "dlq-new")
 	require.NoError(t, err)
 
-	// Verify the old message is gone
 	_, err = store.Get(ctx, "dlq-old")
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, ErrNotFound))
@@ -278,16 +327,15 @@ func TestRedisStore_Count(t *testing.T) {
 	store, _ := setupRedisStore(t)
 	ctx := context.Background()
 
-	// Empty store
 	count, err := store.Count(ctx, Filter{})
 	require.NoError(t, err)
 	assert.Equal(t, int64(0), count)
 
-	// Store messages
+	base := time.Now().Truncate(time.Second)
 	msgs := []*Message{
-		{ID: "dlq-c1", EventName: "order.created", Payload: []byte("p"), Error: "e", CreatedAt: time.Now(), Source: "svc-a"},
-		{ID: "dlq-c2", EventName: "order.updated", Payload: []byte("p"), Error: "e", CreatedAt: time.Now(), Source: "svc-b"},
-		{ID: "dlq-c3", EventName: "order.created", Payload: []byte("p"), Error: "e", CreatedAt: time.Now(), Source: "svc-a"},
+		{ID: "dlq-c1", EventName: "order.created", Payload: []byte("p"), Error: "e", CreatedAt: base.Add(-2 * time.Hour), Source: "svc-a"},
+		{ID: "dlq-c2", EventName: "order.updated", Payload: []byte("p"), Error: "e", CreatedAt: base.Add(-1 * time.Hour), Source: "svc-b"},
+		{ID: "dlq-c3", EventName: "order.created", Payload: []byte("p"), Error: "e", CreatedAt: base, Source: "svc-a"},
 	}
 	for _, m := range msgs {
 		require.NoError(t, store.Store(ctx, m))
@@ -305,6 +353,12 @@ func TestRedisStore_Count(t *testing.T) {
 		assert.Equal(t, int64(2), count)
 	})
 
+	t.Run("count with time filter", func(t *testing.T) {
+		count, err := store.Count(ctx, Filter{StartTime: base.Add(-90 * time.Minute)})
+		require.NoError(t, err)
+		assert.Equal(t, int64(2), count)
+	})
+
 	t.Run("count with complex filter", func(t *testing.T) {
 		count, err := store.Count(ctx, Filter{Source: "svc-b"})
 		require.NoError(t, err)
@@ -318,7 +372,7 @@ func TestRedisStore_Health(t *testing.T) {
 
 	result := store.Health(ctx)
 	assert.Equal(t, health.StatusHealthy, result.Status)
-	assert.Contains(t, result.Details, "stream_key")
+	assert.Contains(t, result.Details, "time_key")
 	assert.Contains(t, result.Details, "message_count")
 }
 
@@ -328,7 +382,6 @@ func TestRedisStore_Health_Unhealthy(t *testing.T) {
 	store, err := NewRedisStore(client)
 	require.NoError(t, err)
 
-	// Close miniredis to simulate connection failure
 	mr.Close()
 
 	result := store.Health(context.Background())
@@ -343,20 +396,17 @@ func TestRedisStore_Store_Atomicity(t *testing.T) {
 	err := store.Store(ctx, msg)
 	require.NoError(t, err)
 
-	// Verify message can be retrieved with all fields
 	got, err := store.Get(ctx, "dlq-atomic-1")
 	require.NoError(t, err)
 	assert.Equal(t, "dlq-atomic-1", got.ID)
 	assert.Equal(t, "order.created", got.EventName)
 	assert.Equal(t, "orig-dlq-atomic-1", got.OriginalID)
 
-	// Verify event index was populated (list by event name returns the message)
 	msgs, err := store.List(ctx, Filter{EventName: "order.created"})
 	require.NoError(t, err)
 	require.Len(t, msgs, 1)
 	assert.Equal(t, "dlq-atomic-1", msgs[0].ID)
 
-	// Verify count works
 	count, err := store.Count(ctx, Filter{EventName: "order.created"})
 	require.NoError(t, err)
 	assert.Equal(t, int64(1), count)
@@ -373,7 +423,6 @@ func TestRedisStore_GetByOriginalID(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "dlq-orig-1", retrieved.ID)
 
-	// Not found
 	_, err = store.GetByOriginalID(ctx, "non-existent")
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, ErrNotFound))
@@ -414,7 +463,6 @@ func TestRedisStore_Stats(t *testing.T) {
 		require.NoError(t, store.Store(ctx, m))
 	}
 
-	// Mark one as retried
 	require.NoError(t, store.MarkRetried(ctx, "dlq-s1"))
 
 	stats, err := store.Stats(ctx)
@@ -438,13 +486,7 @@ func TestNewRedisStore_Options(t *testing.T) {
 	t.Run("custom key prefix", func(t *testing.T) {
 		store, err := NewRedisStore(client, WithKeyPrefix("custom:"))
 		require.NoError(t, err)
-		assert.Equal(t, "custom:messages", store.streamKey)
+		assert.Equal(t, "custom:by_time", store.timeKey)
 		assert.Equal(t, "custom:msg:", store.msgPrefix)
-	})
-
-	t.Run("custom max length", func(t *testing.T) {
-		store, err := NewRedisStore(client, WithMaxLen(1000))
-		require.NoError(t, err)
-		assert.Equal(t, int64(1000), store.maxLen)
 	})
 }

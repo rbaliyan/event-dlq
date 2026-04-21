@@ -132,7 +132,7 @@ func (s *MemoryStore) matchesFilter(msg *Message, filter Filter) bool {
 		return false
 	}
 
-	if filter.Error != "" && !strings.Contains(msg.Error, filter.Error) {
+	if filter.Error != "" && !strings.Contains(strings.ToLower(msg.Error), strings.ToLower(filter.Error)) {
 		return false
 	}
 

@@ -27,7 +27,10 @@ import (
 // Example:
 //
 //	store := dlq.NewPostgresStore(db)
-//	manager := dlq.NewManager(store, transport)
+//	manager, err := dlq.NewManager(store, transport)
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
 //
 //	// Store a failed message
 //	manager.Store(ctx, dlq.StoreParams{
@@ -144,7 +147,10 @@ func WithLogger(l *slog.Logger) ManagerOption {
 // Example:
 //
 //	metrics, _ := dlq.NewMetrics()
-//	manager := dlq.NewManager(store, transport, dlq.WithMetrics(metrics))
+//	manager, err := dlq.NewManager(store, transport, dlq.WithMetrics(metrics))
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
 func WithMetrics(m *Metrics) ManagerOption {
 	return func(o *managerOptions) {
 		o.metrics = m
@@ -164,7 +170,7 @@ func WithMetrics(m *Metrics) ManagerOption {
 //	// Using the event library's backoff package
 //	import "github.com/rbaliyan/event/v3/backoff"
 //
-//	manager := dlq.NewManager(store, transport,
+//	manager, err := dlq.NewManager(store, transport,
 //	    dlq.WithBackoff(&backoff.Exponential{
 //	        Initial:    time.Second,
 //	        Multiplier: 2.0,
@@ -173,6 +179,9 @@ func WithMetrics(m *Metrics) ManagerOption {
 //	    }),
 //	    dlq.WithMaxRetries(3),
 //	)
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
 func WithBackoff(strategy BackoffStrategy) ManagerOption {
 	return func(o *managerOptions) {
 		o.backoff = strategy
@@ -189,10 +198,13 @@ func WithBackoff(strategy BackoffStrategy) ManagerOption {
 //
 // Example:
 //
-//	manager := dlq.NewManager(store, transport,
+//	manager, err := dlq.NewManager(store, transport,
 //	    dlq.WithBackoff(backoffStrategy),
 //	    dlq.WithMaxRetries(3),
 //	)
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
 func WithMaxRetries(max int) ManagerOption {
 	return func(o *managerOptions) {
 		if max >= 0 {
@@ -219,11 +231,14 @@ func WithMaxRetries(max int) ManagerOption {
 //	store := dlq.NewRedisStore(redisClient)
 //
 //	// Using a bus (recommended for MongoDB and other non-publishable transports)
-//	manager := dlq.NewManager(store, bus)
+//	manager, err := dlq.NewManager(store, bus)
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
 //
 //	// With metrics and retry backoff
 //	metrics, _ := dlq.NewMetrics()
-//	manager := dlq.NewManager(store, bus,
+//	manager, err = dlq.NewManager(store, bus,
 //	    dlq.WithMetrics(metrics),
 //	    dlq.WithBackoff(backoffStrategy),
 //	    dlq.WithMaxRetries(3),

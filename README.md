@@ -51,7 +51,10 @@ store := dlq.NewMemoryStore()                    // For testing
 // store := dlq.NewRedisStore(redisClient)       // For Redis
 
 // Create the manager with your transport
-manager := dlq.NewManager(store, transport)
+manager, err := dlq.NewManager(store, transport)
+if err != nil {
+    log.Fatal(err)
+}
 ```
 
 ### Storing Failed Messages
@@ -220,7 +223,7 @@ CREATE INDEX idx_dlq_retried_at ON event_dlq(retried_at) WHERE retried_at IS NUL
 ### MongoDB
 
 ```go
-import "go.mongodb.org/mongo-driver/mongo"
+import "go.mongodb.org/mongo-driver/v2/mongo"
 
 db := mongoClient.Database("myapp")
 store := dlq.NewMongoStore(db).

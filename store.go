@@ -24,7 +24,10 @@
 //
 //	// Create store and manager
 //	store := dlq.NewPostgresStore(db)
-//	manager := dlq.NewManager(store, transport)
+//	manager, err := dlq.NewManager(store, transport)
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
 //
 //	// Store a failed message (typically in handler error path)
 //	if err := handler(ctx, msg); err != nil {

@@ -128,7 +128,10 @@ bus, _ := event.NewBus("orders",
 
 ```go
 dlqStore := dlq.NewMongoStore(db.Collection("_dlq"))
-dlqManager := dlq.NewManager(dlqStore, transport)
+dlqManager, err := dlq.NewManager(dlqStore, transport)
+if err != nil {
+    log.Fatal(err)
+}
 
 // In handler
 if retryCount >= maxRetries {

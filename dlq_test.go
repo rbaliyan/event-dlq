@@ -116,7 +116,7 @@ func TestMemoryStore(t *testing.T) {
 		_ = store.Store(ctx, &Message{ID: "dlq-2", EventName: "event", CreatedAt: now.Add(-1 * time.Hour)})
 		_ = store.Store(ctx, &Message{ID: "dlq-3", EventName: "event", CreatedAt: now})
 
-		messages, err := store.List(ctx, Filter{StartTime: now.Add(-90 * time.Minute)})
+		messages, err := store.List(ctx, Filter{After: now.Add(-90 * time.Minute)})
 		if err != nil {
 			t.Fatalf("List failed: %v", err)
 		}

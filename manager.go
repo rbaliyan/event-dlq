@@ -378,7 +378,7 @@ func (m *Manager) Count(ctx context.Context, filter Filter) (int64, error) {
 //	// Replay all unretried payment failures from the last day
 //	replayed, err := manager.Replay(ctx, dlq.Filter{
 //	    EventName:      "payment.process",
-//	    StartTime:      time.Now().Add(-24 * time.Hour),
+//	    After:          time.Now().Add(-24 * time.Hour),
 //	    ExcludeRetried: true,
 //	})
 //	log.Info("replayed messages", "count", replayed)

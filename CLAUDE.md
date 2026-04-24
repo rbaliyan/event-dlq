@@ -63,8 +63,8 @@ type Message struct {
 // Filter for querying messages
 type Filter struct {
     EventName      string
-    StartTime      time.Time
-    EndTime        time.Time
+    After          time.Time // messages received after this time
+    Before         time.Time // messages received before this time
     Error          string    // Contains match
     MaxRetries     int
     Source         string

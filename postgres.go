@@ -267,8 +267,8 @@ func (s *PostgresStore) buildFilterClauses(filter Filter) *base.QueryBuilder {
 	qb := base.NewQueryBuilder()
 
 	qb.AddIfNotEmpty("event_name = $%d", filter.EventName)
-	qb.AddIfNotZero("created_at >= $%d", filter.StartTime)
-	qb.AddIfNotZero("created_at <= $%d", filter.EndTime)
+	qb.AddIfNotZero("created_at >= $%d", filter.After)
+	qb.AddIfNotZero("created_at <= $%d", filter.Before)
 	if filter.Error != "" {
 		qb.Add("error ILIKE $%d", "%"+filter.Error+"%")
 	}

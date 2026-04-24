@@ -92,9 +92,9 @@ func runStoreContractTests(t *testing.T, store Store) {
 		}
 	})
 
-	t.Run("List/StartTime", func(t *testing.T) {
+	t.Run("List/After", func(t *testing.T) {
 		// base-2h and newer: c-3, c-4, c-5, c-6 = 4
-		results, err := store.List(ctx, Filter{StartTime: base.Add(-2 * time.Hour)})
+		results, err := store.List(ctx, Filter{After: base.Add(-2 * time.Hour)})
 		require.NoError(t, err)
 		assert.Len(t, results, 4)
 		for _, r := range results {
@@ -102,9 +102,9 @@ func runStoreContractTests(t *testing.T, store Store) {
 		}
 	})
 
-	t.Run("List/EndTime", func(t *testing.T) {
+	t.Run("List/Before", func(t *testing.T) {
 		// base-2h and older: c-1, c-2, c-3 = 3
-		results, err := store.List(ctx, Filter{EndTime: base.Add(-2 * time.Hour)})
+		results, err := store.List(ctx, Filter{Before: base.Add(-2 * time.Hour)})
 		require.NoError(t, err)
 		assert.Len(t, results, 3)
 		for _, r := range results {
@@ -115,8 +115,8 @@ func runStoreContractTests(t *testing.T, store Store) {
 	t.Run("List/TimeRange", func(t *testing.T) {
 		// between base-3h and base-1h: c-2, c-3, c-4 = 3
 		results, err := store.List(ctx, Filter{
-			StartTime: base.Add(-3 * time.Hour),
-			EndTime:   base.Add(-1 * time.Hour),
+			After: base.Add(-3 * time.Hour),
+			Before:   base.Add(-1 * time.Hour),
 		})
 		require.NoError(t, err)
 		assert.Len(t, results, 3)
@@ -126,7 +126,7 @@ func runStoreContractTests(t *testing.T, store Store) {
 		// order.created from base-3h onward: c-2, c-5 = 2
 		results, err := store.List(ctx, Filter{
 			EventName: "order.created",
-			StartTime: base.Add(-3 * time.Hour),
+			After: base.Add(-3 * time.Hour),
 		})
 		require.NoError(t, err)
 		assert.Len(t, results, 2)
@@ -209,8 +209,8 @@ func runStoreContractTests(t *testing.T, store Store) {
 		assert.Equal(t, int64(3), count)
 	})
 
-	t.Run("Count/StartTime", func(t *testing.T) {
-		count, err := store.Count(ctx, Filter{StartTime: base.Add(-2 * time.Hour)})
+	t.Run("Count/After", func(t *testing.T) {
+		count, err := store.Count(ctx, Filter{After: base.Add(-2 * time.Hour)})
 		require.NoError(t, err)
 		assert.Equal(t, int64(4), count)
 	})
@@ -224,7 +224,7 @@ func runStoreContractTests(t *testing.T, store Store) {
 
 	t.Run("Count/MatchesList", func(t *testing.T) {
 		// Count and List must agree for every filter combination.
-		filter := Filter{EventName: "order.created", StartTime: base.Add(-3 * time.Hour)}
+		filter := Filter{EventName: "order.created", After: base.Add(-3 * time.Hour)}
 		results, err := store.List(ctx, filter)
 		require.NoError(t, err)
 		count, err := store.Count(ctx, filter)

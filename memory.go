@@ -124,11 +124,11 @@ func (s *MemoryStore) matchesFilter(msg *Message, filter Filter) bool {
 		return false
 	}
 
-	if !filter.StartTime.IsZero() && msg.CreatedAt.Before(filter.StartTime) {
+	if !filter.After.IsZero() && msg.CreatedAt.Before(filter.After) {
 		return false
 	}
 
-	if !filter.EndTime.IsZero() && msg.CreatedAt.After(filter.EndTime) {
+	if !filter.Before.IsZero() && msg.CreatedAt.After(filter.Before) {
 		return false
 	}
 

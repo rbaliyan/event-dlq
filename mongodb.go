@@ -386,13 +386,13 @@ func (s *MongoStore) buildFilter(filter Filter) bson.M {
 		mongoFilter["event_name"] = filter.EventName
 	}
 
-	if !filter.StartTime.IsZero() || !filter.EndTime.IsZero() {
+	if !filter.After.IsZero() || !filter.Before.IsZero() {
 		createdFilter := bson.M{}
-		if !filter.StartTime.IsZero() {
-			createdFilter["$gte"] = filter.StartTime
+		if !filter.After.IsZero() {
+			createdFilter["$gte"] = filter.After
 		}
-		if !filter.EndTime.IsZero() {
-			createdFilter["$lte"] = filter.EndTime
+		if !filter.Before.IsZero() {
+			createdFilter["$lte"] = filter.Before
 		}
 		mongoFilter["created_at"] = createdFilter
 	}

@@ -47,7 +47,7 @@
 //	// Later: Replay failed messages after fixing the issue
 //	replayed, err := manager.Replay(ctx, dlq.Filter{
 //	    EventName: "orders.created",
-//	    StartTime: time.Now().Add(-24 * time.Hour),
+//	    After: time.Now().Add(-24 * time.Hour),
 //	})
 //
 // # Monitoring
@@ -114,14 +114,14 @@ type Message struct {
 //	// Find recent payment failures
 //	filter := dlq.Filter{
 //	    EventName:      "payment.process",
-//	    StartTime:      time.Now().Add(-24 * time.Hour),
+//	    After:          time.Now().Add(-24 * time.Hour),
 //	    ExcludeRetried: true,
 //	    Limit:          100,
 //	}
 type Filter struct {
 	EventName      string    // Filter by event name (empty = all events)
-	StartTime      time.Time // Filter messages after this time (zero = no minimum)
-	EndTime        time.Time // Filter messages before this time (zero = no maximum)
+	After          time.Time // Filter messages received after this time (zero = no minimum)
+	Before         time.Time // Filter messages received before this time (zero = no maximum)
 	Error          string    // Filter by error message (contains match)
 	MaxRetries     int       // Filter by retry count (0 = no limit)
 	Source         string    // Filter by source service (empty = all sources)

@@ -169,8 +169,8 @@ func BenchmarkFilterCreation(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		_ = Filter{
 			EventName:      "orders.created",
-			StartTime:      now.Add(-24 * time.Hour),
-			EndTime:        now,
+			After:      now.Add(-24 * time.Hour),
+			Before:        now,
 			ExcludeRetried: true,
 			Limit:          100,
 		}

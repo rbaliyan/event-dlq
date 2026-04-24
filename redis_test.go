@@ -204,7 +204,7 @@ func TestRedisStore_List_TimeFilter(t *testing.T) {
 	}
 
 	t.Run("start time excludes old", func(t *testing.T) {
-		results, err := store.List(ctx, Filter{StartTime: base.Add(-90 * time.Minute)})
+		results, err := store.List(ctx, Filter{After: base.Add(-90 * time.Minute)})
 		require.NoError(t, err)
 		assert.Len(t, results, 2)
 		ids := make([]string, len(results))
@@ -216,7 +216,7 @@ func TestRedisStore_List_TimeFilter(t *testing.T) {
 	})
 
 	t.Run("end time excludes new", func(t *testing.T) {
-		results, err := store.List(ctx, Filter{EndTime: base.Add(-90 * time.Minute)})
+		results, err := store.List(ctx, Filter{Before: base.Add(-90 * time.Minute)})
 		require.NoError(t, err)
 		assert.Len(t, results, 1)
 		assert.Equal(t, "tf-old", results[0].ID)
@@ -224,8 +224,8 @@ func TestRedisStore_List_TimeFilter(t *testing.T) {
 
 	t.Run("start and end time", func(t *testing.T) {
 		results, err := store.List(ctx, Filter{
-			StartTime: base.Add(-90 * time.Minute),
-			EndTime:   base.Add(-30 * time.Minute),
+			After: base.Add(-90 * time.Minute),
+			Before:   base.Add(-30 * time.Minute),
 		})
 		require.NoError(t, err)
 		assert.Len(t, results, 1)
@@ -235,7 +235,7 @@ func TestRedisStore_List_TimeFilter(t *testing.T) {
 	t.Run("event name with time filter", func(t *testing.T) {
 		results, err := store.List(ctx, Filter{
 			EventName: "order.created",
-			StartTime: base.Add(-90 * time.Minute),
+			After: base.Add(-90 * time.Minute),
 		})
 		require.NoError(t, err)
 		assert.Len(t, results, 2)
@@ -354,7 +354,7 @@ func TestRedisStore_Count(t *testing.T) {
 	})
 
 	t.Run("count with time filter", func(t *testing.T) {
-		count, err := store.Count(ctx, Filter{StartTime: base.Add(-90 * time.Minute)})
+		count, err := store.Count(ctx, Filter{After: base.Add(-90 * time.Minute)})
 		require.NoError(t, err)
 		assert.Equal(t, int64(2), count)
 	})

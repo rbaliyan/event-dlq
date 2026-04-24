@@ -250,18 +250,18 @@ func (s *RedisStore) parseMessage(fields map[string]string) (*Message, error) {
 // timeRange builds ZRangeBy min/max from filter time bounds.
 func timeRange(filter Filter) *redis.ZRangeBy {
 	r := &redis.ZRangeBy{Min: "-inf", Max: "+inf"}
-	if !filter.StartTime.IsZero() {
-		r.Min = strconv.FormatInt(filter.StartTime.Unix(), 10)
+	if !filter.After.IsZero() {
+		r.Min = strconv.FormatInt(filter.After.Unix(), 10)
 	}
-	if !filter.EndTime.IsZero() {
-		r.Max = strconv.FormatInt(filter.EndTime.Unix(), 10)
+	if !filter.Before.IsZero() {
+		r.Max = strconv.FormatInt(filter.Before.Unix(), 10)
 	}
 	return r
 }
 
 // List returns messages matching the filter.
 //
-// Time bounds (StartTime, EndTime) are pushed to Redis via ZRANGEBYSCORE for
+// Time bounds (After, Before) are pushed to Redis via ZRANGEBYSCORE for
 // O(log N + M) retrieval. EventName selects the per-event sorted set.
 // Remaining filters (Source, Error, MaxRetries, ExcludeRetried) are applied
 // in-memory after the bulk fetch.

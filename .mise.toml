@@ -1,6 +1,6 @@
 [tools]
-go = "1.25"
+go = "1.26.3"
 just = "latest"
-golangci-lint = "v2.8.0"
+golangci-lint = "v2.11.4"
 "go:golang.org/x/vuln/cmd/govulncheck" = "latest"
 "go:github.com/securego/gosec/v2/cmd/gosec" = "v2.25.0"

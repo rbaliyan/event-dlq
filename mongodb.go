@@ -798,6 +798,109 @@ func (s *MongoStore) Health(ctx context.Context) *health.Result {
 	}
 }
 
+// MigrateDedup collapses historical duplicate (event_name, original_id) groups
+// into a single document: the newest document by created_at is kept as the
+// survivor; its retry_count is replaced with the sum of all duplicates' counts;
+// its created_at is set to the oldest in the group; and the earliest
+// quarantined_at (if any document in the group was quarantined) is propagated.
+// After all duplicates are resolved, the unique (event_name, original_id) index
+// is created via EnsureIndexes.
+//
+// Safety guard: if collapsing would delete more than 50% of all documents in the
+// collection, MigrateDedup returns an error without modifying anything. Pass
+// WithForce to skip the guard. This protects against accidentally running the
+// migration against the wrong collection.
+//
+// MigrateDedup is idempotent: a second call on a clean (already-deduplicated)
+// collection removes 0 documents and re-runs EnsureIndexes (which is a no-op
+// when the index already exists).
+//
+// Returns the number of documents removed.
+func (s *MongoStore) MigrateDedup(ctx context.Context, opts ...MigrateDedupOption) (int64, error) {
+	o := applyMigrateDedupOptions(opts)
+
+	total, err := s.collection.CountDocuments(ctx, bson.M{})
+	if err != nil {
+		return 0, fmt.Errorf("count: %w", err)
+	}
+
+	// Find all groups of (event_name, original_id) that have more than one document.
+	// Sort by created_at ascending so $push produces IDs in oldest-first order;
+	// the last element in each group is the newest (survivor).
+	cursor, err := s.collection.Aggregate(ctx, mongo.Pipeline{
+		bson.D{{Key: "$match", Value: bson.M{"original_id": bson.M{"$ne": ""}}}},
+		bson.D{{Key: "$sort", Value: bson.D{{Key: "created_at", Value: 1}}}},
+		bson.D{{Key: "$group", Value: bson.M{
+			"_id":            bson.M{"event_name": "$event_name", "original_id": "$original_id"},
+			"ids":            bson.M{"$push": "$_id"},
+			"sumRetry":       bson.M{"$sum": "$retry_count"},
+			"minCreated":     bson.M{"$min": "$created_at"},
+			"minQuarantined": bson.M{"$min": "$quarantined_at"},
+			"count":          bson.M{"$sum": 1},
+		}}},
+		bson.D{{Key: "$match", Value: bson.M{"count": bson.M{"$gt": 1}}}},
+	})
+	if err != nil {
+		return 0, fmt.Errorf("aggregate duplicates: %w", err)
+	}
+	defer func() { _ = cursor.Close(ctx) }()
+
+	type group struct {
+		IDs            []string   `bson:"ids"`
+		SumRetry       int        `bson:"sumRetry"`
+		MinCreated     time.Time  `bson:"minCreated"`
+		MinQuarantined *time.Time `bson:"minQuarantined"`
+	}
+	var groups []group
+	if err := cursor.All(ctx, &groups); err != nil {
+		return 0, fmt.Errorf("decode groups: %w", err)
+	}
+
+	// Count how many documents would be deleted (all but the survivor in each group).
+	var toDelete int64
+	for _, g := range groups {
+		toDelete += int64(len(g.IDs) - 1)
+	}
+
+	if !o.force && total > 0 && toDelete*2 > total {
+		return 0, fmt.Errorf(
+			"dlq: MigrateDedup would delete %d of %d documents (>50%%); pass WithForce to proceed",
+			toDelete, total,
+		)
+	}
+
+	var removed int64
+	for _, g := range groups {
+		// IDs are sorted oldest→newest by the $sort + $push; keep the newest (last).
+		keep := g.IDs[len(g.IDs)-1]
+		drop := g.IDs[:len(g.IDs)-1]
+
+		set := bson.M{
+			"retry_count": g.SumRetry,
+			"created_at":  g.MinCreated,
+		}
+		if g.MinQuarantined != nil {
+			set["quarantined_at"] = *g.MinQuarantined
+		}
+
+		if _, err := s.collection.UpdateByID(ctx, keep, bson.M{"$set": set}); err != nil {
+			return removed, fmt.Errorf("update survivor %q: %w", keep, err)
+		}
+
+		res, err := s.collection.DeleteMany(ctx, bson.M{"_id": bson.M{"$in": drop}})
+		if err != nil {
+			return removed, fmt.Errorf("delete duplicates: %w", err)
+		}
+		removed += res.DeletedCount
+	}
+
+	// Create the unique (event_name, original_id) index now that duplicates are gone.
+	if err := s.EnsureIndexes(ctx); err != nil {
+		return removed, fmt.Errorf("ensure indexes after dedup: %w", err)
+	}
+	return removed, nil
+}
+
 // Compile-time checks
 var _ Store = (*MongoStore)(nil)
 var _ StatsProvider = (*MongoStore)(nil)

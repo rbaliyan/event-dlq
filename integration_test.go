@@ -5,12 +5,14 @@ package dlq
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"os"
 	"testing"
 	"time"
 
 	_ "github.com/lib/pq"
 	"github.com/rbaliyan/event/v3/health"
+	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
@@ -323,6 +325,106 @@ func TestMongoStoreDedup(t *testing.T) {
 	_ = on2.Store(ctx, &Message{ID: "b", EventName: "e", OriginalID: "", CreatedAt: time.Now()})
 	if n, _ := on2.Count(ctx, Filter{}); n != 2 {
 		t.Fatalf("empty original under dedup: want 2, got %d", n)
+	}
+}
+
+func TestMongoStoreMigrateDedup(t *testing.T) {
+	client := getMongoClient(t)
+	ctx := context.Background()
+
+	dbName := "dlq_migrate_test_" + time.Now().Format("20060102150405")
+	db := client.Database(dbName)
+	t.Cleanup(func() { _ = db.Drop(context.Background()) })
+
+	store, err := NewMongoStore(db, WithCollection("dlq_migrate_test"), WithMongoDedup())
+	if err != nil {
+		t.Fatalf("NewMongoStore: %v", err)
+	}
+	coll := store.Collection()
+	_ = coll.Drop(ctx)
+	t.Cleanup(func() { _ = coll.Drop(ctx) })
+
+	// Seed 3 duplicate docs for (e, o1) with distinct _ids, plus 1 unique (e, o2).
+	// Insert directly via the collection to bypass the dedup upsert path.
+	old := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
+	mid := time.Now().Add(-1 * time.Hour).UTC().Truncate(time.Millisecond)
+	newest := time.Now().UTC().Truncate(time.Millisecond)
+	docs := []interface{}{
+		bson.M{"_id": "d1", "event_name": "e", "original_id": "o1", "error": "e1", "retry_count": 1, "created_at": mid},
+		bson.M{"_id": "d2", "event_name": "e", "original_id": "o1", "error": "e2", "retry_count": 2, "created_at": old},
+		bson.M{"_id": "d3", "event_name": "e", "original_id": "o1", "error": "e3", "retry_count": 3, "created_at": newest},
+		bson.M{"_id": "u1", "event_name": "e", "original_id": "o2", "error": "x", "retry_count": 5, "created_at": newest},
+	}
+	if _, err := coll.InsertMany(ctx, docs); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	// Without force, deleting 2 of 4 rows (50%) is allowed (guard triggers only at >50%).
+	removed, err := store.MigrateDedup(ctx)
+	if err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	if removed != 2 {
+		t.Fatalf("want 2 removed, got %d", removed)
+	}
+
+	// One survivor for (e,o1): newest doc (d3) kept, retry_count summed = 6, created_at = oldest.
+	survivor, err := store.GetByOriginalID(ctx, "o1")
+	if err != nil {
+		t.Fatalf("get survivor: %v", err)
+	}
+	if survivor.ID != "d3" {
+		t.Fatalf("expected newest doc d3 kept, got %s", survivor.ID)
+	}
+	if survivor.RetryCount != 6 {
+		t.Fatalf("expected summed retry_count 6, got %d", survivor.RetryCount)
+	}
+	if !survivor.CreatedAt.UTC().Equal(old) {
+		t.Fatalf("expected oldest created_at %v, got %v", old, survivor.CreatedAt.UTC())
+	}
+
+	if n, _ := store.Count(ctx, Filter{}); n != 2 {
+		t.Fatalf("expected 2 docs total after migrate, got %d", n)
+	}
+
+	// Unique index now present: a raw duplicate insert for (e,o1) must fail.
+	_, err = coll.InsertOne(ctx, bson.M{"_id": "dup", "event_name": "e", "original_id": "o1", "created_at": newest})
+	if err == nil {
+		t.Fatal("expected duplicate-key error after unique index created")
+	}
+}
+
+func TestMongoStoreMigrateDedup_ForceGuard(t *testing.T) {
+	client := getMongoClient(t)
+	ctx := context.Background()
+
+	dbName := "dlq_migrate_guard_test_" + time.Now().Format("20060102150405")
+	db := client.Database(dbName)
+	t.Cleanup(func() { _ = db.Drop(context.Background()) })
+
+	store, err := NewMongoStore(db, WithCollection("dlq_migrate_guard_test"), WithMongoDedup())
+	if err != nil {
+		t.Fatalf("NewMongoStore: %v", err)
+	}
+	coll := store.Collection()
+	_ = coll.Drop(ctx)
+	t.Cleanup(func() { _ = coll.Drop(ctx) })
+
+	// 4 docs all same (e,o1): collapsing deletes 3 of 4 = 75% > 50% => guarded.
+	var docs []interface{}
+	for i := 0; i < 4; i++ {
+		docs = append(docs, bson.M{"_id": fmt.Sprintf("d%d", i), "event_name": "e", "original_id": "o1", "retry_count": 1, "created_at": time.Now().UTC()})
+	}
+	_, _ = coll.InsertMany(ctx, docs)
+
+	if _, err := store.MigrateDedup(ctx); err == nil {
+		t.Fatal("expected guard error when >50% would be deleted")
+	}
+	if _, err := store.MigrateDedup(ctx, WithForce()); err != nil {
+		t.Fatalf("with force: %v", err)
+	}
+	if n, _ := store.Count(ctx, Filter{}); n != 1 {
+		t.Fatalf("after forced migrate want 1, got %d", n)
 	}
 }
 

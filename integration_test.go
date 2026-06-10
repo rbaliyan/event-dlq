@@ -479,3 +479,47 @@ func TestMongoStoreQuarantine(t *testing.T) {
 		t.Fatal("expected error quarantining missing message")
 	}
 }
+
+func TestPostgresStoreQuarantine(t *testing.T) {
+	db := getPostgresDB(t)
+	ctx := context.Background()
+	store, err := NewPostgresStore(db, WithTable("dlq_pg_quarantine_test"))
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	_, _ = db.ExecContext(ctx, "DROP TABLE IF EXISTS dlq_pg_quarantine_test")
+	if err := store.EnsureTable(ctx); err != nil {
+		t.Fatalf("ensure table: %v", err)
+	}
+	t.Cleanup(func() { _, _ = db.ExecContext(ctx, "DROP TABLE IF EXISTS dlq_pg_quarantine_test") })
+
+	now := time.Now()
+	if err := store.Store(ctx, &Message{ID: "m1", EventName: "e", OriginalID: "o1", Payload: []byte("{}"), Error: "x", CreatedAt: now}); err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	if err := store.Quarantine(ctx, "m1"); err != nil {
+		t.Fatalf("quarantine: %v", err)
+	}
+	got, err := store.Get(ctx, "m1")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.QuarantinedAt == nil {
+		t.Fatal("expected QuarantinedAt set")
+	}
+	list, _ := store.List(ctx, Filter{ExcludeQuarantined: true})
+	for _, m := range list {
+		if m.ID == "m1" {
+			t.Fatal("ExcludeQuarantined must hide quarantined message")
+		}
+	}
+	if err := store.Quarantine(ctx, "missing"); err == nil {
+		t.Fatal("expected error quarantining missing id")
+	}
+
+	// Long original_id (former VARCHAR(36) would have rejected this ~140-char value)
+	longID := "826A100506000000112B042C0100296E5A100475D36D2326024308B40C3D05BFEF1AE7463C6F7065726174696F6E54797065003C7570646174650046646F63756D656E744B6579"
+	if err := store.Store(ctx, &Message{ID: "m2", EventName: "e", OriginalID: longID, Payload: []byte("{}"), Error: "x", CreatedAt: now}); err != nil {
+		t.Fatalf("store long original_id (TEXT widen): %v", err)
+	}
+}

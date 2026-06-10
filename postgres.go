@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"regexp"
 	"time"
 
@@ -41,6 +42,7 @@ type PostgresStoreOption func(*postgresStoreOptions)
 
 type postgresStoreOptions struct {
 	table string
+	dedup bool
 }
 
 // WithTable sets a custom table name.
@@ -53,10 +55,23 @@ func WithTable(table string) PostgresStoreOption {
 	}
 }
 
+// WithPostgresDedup enables deduplication mode for the PostgresStore.
+// When enabled, EnsureTable will create a unique index on (event_name, original_id),
+// preventing duplicate DLQ entries for the same original message. Only enable this
+// after ensuring no duplicate (event_name, original_id) rows exist (see MigrateDedup).
+// When disabled (the default), multiple failures of the same original message each
+// get their own row, which is the correct behavior for plain INSERT semantics.
+func WithPostgresDedup() PostgresStoreOption {
+	return func(o *postgresStoreOptions) {
+		o.dedup = true
+	}
+}
+
 // PostgresStore is a PostgreSQL-based DLQ store
 type PostgresStore struct {
 	db    *sql.DB
 	table string
+	dedup bool
 }
 
 // NewPostgresStore creates a new PostgreSQL DLQ store.
@@ -80,24 +95,32 @@ func NewPostgresStore(db *sql.DB, opts ...PostgresStoreOption) (*PostgresStore, 
 	return &PostgresStore{
 		db:    db,
 		table: o.table,
+		dedup: o.dedup,
 	}, nil
 }
 
 // EnsureTable creates the DLQ table and indexes if they don't exist.
 // This is safe to call multiple times (uses IF NOT EXISTS).
+// When the store was constructed with WithPostgresDedup, EnsureTable also
+// attempts to create a unique index on (event_name, original_id). That step
+// is failure-tolerant: if legacy duplicate rows block the index, a warning is
+// logged and EnsureTable still succeeds. Run MigrateDedup to remove duplicates
+// before re-calling EnsureTable so the unique index is created.
+// #nosec G201 -- table name is set at construction, not user input
 func (s *PostgresStore) EnsureTable(ctx context.Context) error {
 	query := fmt.Sprintf(`
 		CREATE TABLE IF NOT EXISTS %s (
-			id          VARCHAR(36) PRIMARY KEY,
-			event_name  VARCHAR(255) NOT NULL,
-			original_id VARCHAR(36) NOT NULL,
-			payload     BYTEA NOT NULL,
-			metadata    JSONB,
-			error       TEXT NOT NULL,
-			retry_count INT NOT NULL DEFAULT 0,
-			source      VARCHAR(255),
-			created_at  TIMESTAMP NOT NULL DEFAULT NOW(),
-			retried_at  TIMESTAMP
+			id             VARCHAR(36) PRIMARY KEY,
+			event_name     VARCHAR(255) NOT NULL,
+			original_id    TEXT NOT NULL,
+			payload        BYTEA NOT NULL,
+			metadata       JSONB,
+			error          TEXT NOT NULL,
+			retry_count    INT NOT NULL DEFAULT 0,
+			source         VARCHAR(255),
+			created_at     TIMESTAMP NOT NULL DEFAULT NOW(),
+			retried_at     TIMESTAMP,
+			quarantined_at TIMESTAMP
 		)
 	`, s.table)
 
@@ -105,6 +128,19 @@ func (s *PostgresStore) EnsureTable(ctx context.Context) error {
 		return fmt.Errorf("create table: %w", err)
 	}
 
+	// Idempotent schema upgrades for pre-existing tables.
+	// #nosec G201 -- table name is set at construction, not user input
+	alters := []string{
+		fmt.Sprintf("ALTER TABLE %s ALTER COLUMN original_id TYPE TEXT", s.table),
+		fmt.Sprintf("ALTER TABLE %s ADD COLUMN IF NOT EXISTS quarantined_at TIMESTAMP", s.table),
+	}
+	for _, a := range alters {
+		if _, err := s.db.ExecContext(ctx, a); err != nil {
+			return fmt.Errorf("alter table: %w", err)
+		}
+	}
+
+	// #nosec G201 -- table name is set at construction, not user input
 	indexes := []string{
 		fmt.Sprintf("CREATE INDEX IF NOT EXISTS idx_%s_event_name ON %s(event_name)", s.table, s.table),
 		fmt.Sprintf("CREATE INDEX IF NOT EXISTS idx_%s_created_at ON %s(created_at)", s.table, s.table),
@@ -115,6 +151,21 @@ func (s *PostgresStore) EnsureTable(ctx context.Context) error {
 	for _, idx := range indexes {
 		if _, err := s.db.ExecContext(ctx, idx); err != nil {
 			return fmt.Errorf("create index: %w", err)
+		}
+	}
+
+	// Unique dedup index: only created when WithPostgresDedup is set.
+	// Legacy duplicate (event_name, original_id) rows would block creation;
+	// in that case we log a warning and continue rather than failing EnsureTable.
+	// Run MigrateDedup first to remove duplicates, then re-call EnsureTable.
+	if s.dedup {
+		// #nosec G201 -- table name is set at construction, not user input
+		uniqIdx := fmt.Sprintf(
+			"CREATE UNIQUE INDEX IF NOT EXISTS uniq_%s_event_original ON %s(event_name, original_id)",
+			s.table, s.table)
+		if _, err := s.db.ExecContext(ctx, uniqIdx); err != nil {
+			slog.Default().Warn("dlq: unique dedup index not created (legacy duplicates?); run MigrateDedup",
+				"table", s.table, "error", err)
 		}
 	}
 
@@ -135,7 +186,7 @@ func (s *PostgresStore) Store(ctx context.Context, msg *Message) error {
 		return fmt.Errorf("marshal metadata: %w", err)
 	}
 
-// #nosec G201 -- table name is set at construction, not user input
+	// #nosec G201 -- table name is set at construction, not user input
 	query := fmt.Sprintf(`
 		INSERT INTO %s (id, event_name, original_id, payload, metadata, error, retry_count, source, created_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
@@ -164,7 +215,7 @@ func (s *PostgresStore) Store(ctx context.Context, msg *Message) error {
 // #nosec G201 -- table name is set at construction, not user input
 func (s *PostgresStore) Get(ctx context.Context, id string) (*Message, error) {
 	query := fmt.Sprintf(`
-		SELECT id, event_name, original_id, payload, metadata, error, retry_count, source, created_at, retried_at
+		SELECT id, event_name, original_id, payload, metadata, error, retry_count, source, created_at, retried_at, quarantined_at
 		FROM %s
 		WHERE id = $1
 	`, s.table)
@@ -172,6 +223,7 @@ func (s *PostgresStore) Get(ctx context.Context, id string) (*Message, error) {
 	var msg Message
 	var metadata []byte
 	var retriedAt sql.NullTime
+	var quarantinedAt sql.NullTime
 	var source sql.NullString
 
 	err := s.db.QueryRowContext(ctx, query, id).Scan(
@@ -185,6 +237,7 @@ func (s *PostgresStore) Get(ctx context.Context, id string) (*Message, error) {
 		&source,
 		&msg.CreatedAt,
 		&retriedAt,
+		&quarantinedAt,
 	)
 
 	if errors.Is(err, sql.ErrNoRows) {
@@ -196,6 +249,7 @@ func (s *PostgresStore) Get(ctx context.Context, id string) (*Message, error) {
 
 	msg.Metadata, _ = base.UnmarshalMetadata(metadata)
 	msg.RetriedAt = base.NullTime(retriedAt)
+	msg.QuarantinedAt = base.NullTime(quarantinedAt)
 	msg.Source = base.NullString(source)
 
 	return &msg, nil
@@ -216,6 +270,7 @@ func (s *PostgresStore) List(ctx context.Context, filter Filter) ([]*Message, er
 		var msg Message
 		var metadata []byte
 		var retriedAt sql.NullTime
+		var quarantinedAt sql.NullTime
 		var source sql.NullString
 
 		err := rows.Scan(
@@ -229,6 +284,7 @@ func (s *PostgresStore) List(ctx context.Context, filter Filter) ([]*Message, er
 			&source,
 			&msg.CreatedAt,
 			&retriedAt,
+			&quarantinedAt,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("scan: %w", err)
@@ -236,6 +292,7 @@ func (s *PostgresStore) List(ctx context.Context, filter Filter) ([]*Message, er
 
 		msg.Metadata, _ = base.UnmarshalMetadata(metadata)
 		msg.RetriedAt = base.NullTime(retriedAt)
+		msg.QuarantinedAt = base.NullTime(quarantinedAt)
 		msg.Source = base.NullString(source)
 
 		messages = append(messages, &msg)
@@ -275,6 +332,7 @@ func (s *PostgresStore) buildFilterClauses(filter Filter) *base.QueryBuilder {
 	qb.AddIfPositive("retry_count <= $%d", filter.MaxRetries)
 	qb.AddIfNotEmpty("source = $%d", filter.Source)
 	qb.AddRawIf(filter.ExcludeRetried, "retried_at IS NULL")
+	qb.AddRawIf(filter.ExcludeQuarantined, "quarantined_at IS NULL")
 
 	return qb
 }
@@ -288,7 +346,7 @@ func (s *PostgresStore) buildListQuery(filter Filter, countOnly bool) (string, [
 	}
 
 	query := fmt.Sprintf(`
-		SELECT id, event_name, original_id, payload, metadata, error, retry_count, source, created_at, retried_at
+		SELECT id, event_name, original_id, payload, metadata, error, retry_count, source, created_at, retried_at, quarantined_at
 		FROM %s
 		%%s
 		ORDER BY created_at DESC
@@ -324,6 +382,21 @@ func (s *PostgresStore) MarkRetried(ctx context.Context, id string) error {
 		return fmt.Errorf("%s: %w", id, ErrNotFound)
 	}
 
+	return nil
+}
+
+// Quarantine marks a message as a terminal, non-retryable failure.
+// #nosec G201 -- table name is set at construction, not user input
+func (s *PostgresStore) Quarantine(ctx context.Context, id string) error {
+	q := fmt.Sprintf("UPDATE %s SET quarantined_at = $1 WHERE id = $2", s.table)
+	res, err := s.db.ExecContext(ctx, q, time.Now(), id)
+	if err != nil {
+		return fmt.Errorf("quarantine: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("%s: %w", id, ErrNotFound)
+	}
 	return nil
 }
 
@@ -436,7 +509,7 @@ func (s *PostgresStore) Stats(ctx context.Context) (*Stats, error) {
 func (s *PostgresStore) GetByOriginalID(ctx context.Context, originalID string) (*Message, error) {
 	// #nosec G201 -- table name is set at construction, not user input
 	query := fmt.Sprintf(`
-		SELECT id, event_name, original_id, payload, metadata, error, retry_count, source, created_at, retried_at
+		SELECT id, event_name, original_id, payload, metadata, error, retry_count, source, created_at, retried_at, quarantined_at
 		FROM %s
 		WHERE original_id = $1
 	`, s.table)
@@ -444,6 +517,7 @@ func (s *PostgresStore) GetByOriginalID(ctx context.Context, originalID string) 
 	var msg Message
 	var metadata []byte
 	var retriedAt sql.NullTime
+	var quarantinedAt sql.NullTime
 	var source sql.NullString
 
 	err := s.db.QueryRowContext(ctx, query, originalID).Scan(
@@ -457,6 +531,7 @@ func (s *PostgresStore) GetByOriginalID(ctx context.Context, originalID string) 
 		&source,
 		&msg.CreatedAt,
 		&retriedAt,
+		&quarantinedAt,
 	)
 
 	if errors.Is(err, sql.ErrNoRows) {
@@ -468,6 +543,7 @@ func (s *PostgresStore) GetByOriginalID(ctx context.Context, originalID string) 
 
 	msg.Metadata, _ = base.UnmarshalMetadata(metadata)
 	msg.RetriedAt = base.NullTime(retriedAt)
+	msg.QuarantinedAt = base.NullTime(quarantinedAt)
 	msg.Source = base.NullString(source)
 
 	return &msg, nil
@@ -521,3 +597,4 @@ func (s *PostgresStore) Health(ctx context.Context) *health.Result {
 var _ Store = (*PostgresStore)(nil)
 var _ StatsProvider = (*PostgresStore)(nil)
 var _ health.Checker = (*PostgresStore)(nil)
+var _ Quarantiner = (*PostgresStore)(nil)

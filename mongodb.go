@@ -49,7 +49,7 @@ Document structure:
 Indexes:
 db.event_dlq.createIndex({ "event_name": 1 })
 db.event_dlq.createIndex({ "created_at": 1 })
-db.event_dlq.createIndex({ "retried_at": 1 }, { sparse: true })
+db.event_dlq.createIndex({ "retried_at": 1 })
 db.event_dlq.createIndex({ "event_name": 1, "created_at": 1 })
 */
 
@@ -179,8 +179,11 @@ func (s *MongoStore) Indexes() []mongo.IndexModel {
 			Keys: bson.D{{Key: "created_at", Value: 1}},
 		},
 		{
-			Keys:    bson.D{{Key: "retried_at", Value: 1}},
-			Options: options.Index().SetSparse(true),
+			// NOT sparse: pending messages omit retried_at (bson omitempty), and a
+			// sparse index would exclude them, forcing {retried_at: nil} counts and
+			// the ExcludeRetried filter into full collection scans. A non-sparse
+			// index stores the absent field as null so those queries use a COUNT_SCAN.
+			Keys: bson.D{{Key: "retried_at", Value: 1}},
 		},
 		{
 			Keys: bson.D{
@@ -191,10 +194,51 @@ func (s *MongoStore) Indexes() []mongo.IndexModel {
 	}
 }
 
-// EnsureIndexes creates the required indexes for the DLQ collection
+// EnsureIndexes creates the required indexes for the DLQ collection.
+//
+// It also migrates the retried_at index: earlier versions created it as a sparse
+// index, which cannot serve {retried_at: nil} queries (pending messages omit the
+// field) and conflicts with the non-sparse definition this version creates. Any
+// pre-existing sparse retried_at index is dropped first so it can be recreated.
 func (s *MongoStore) EnsureIndexes(ctx context.Context) error {
+	if err := s.dropLegacySparseRetriedIndex(ctx); err != nil {
+		return err
+	}
 	_, err := s.collection.Indexes().CreateMany(ctx, s.Indexes())
 	return err
+}
+
+// dropLegacySparseRetriedIndex removes a pre-existing sparse retried_at_1 index so
+// EnsureIndexes can recreate it as non-sparse. It is a no-op when the collection
+// does not exist, the index is absent, or the index is already non-sparse, so it
+// never rebuilds an index that is already correct.
+func (s *MongoStore) dropLegacySparseRetriedIndex(ctx context.Context) error {
+	cursor, err := s.collection.Indexes().List(ctx)
+	if err != nil {
+		if isNamespaceNotFoundError(err) {
+			return nil // collection not created yet; nothing to migrate
+		}
+		return fmt.Errorf("list indexes: %w", err)
+	}
+	defer func() { _ = cursor.Close(ctx) }()
+
+	var specs []struct {
+		Name   string `bson:"name"`
+		Sparse bool   `bson:"sparse"`
+	}
+	if err := cursor.All(ctx, &specs); err != nil {
+		return fmt.Errorf("decode index specs: %w", err)
+	}
+
+	for _, spec := range specs {
+		if spec.Name == "retried_at_1" && spec.Sparse {
+			if err := s.collection.Indexes().DropOne(ctx, spec.Name); err != nil {
+				return fmt.Errorf("drop legacy sparse index %q: %w", spec.Name, err)
+			}
+			break
+		}
+	}
+	return nil
 }
 
 // IsCapped returns whether the collection is a capped collection.
@@ -520,20 +564,27 @@ func (s *MongoStore) Stats(ctx context.Context) (*Stats, error) {
 		MessagesByError: make(map[string]int64),
 	}
 
-	// Total count
-	total, err := s.collection.CountDocuments(ctx, bson.M{})
+	// Total count. EstimatedDocumentCount reads collection metadata (O(1)) instead
+	// of scanning every document like CountDocuments(bson.M{}) would. The count can
+	// be momentarily stale after an unclean shutdown, which is acceptable for stats.
+	total, err := s.collection.EstimatedDocumentCount(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("count total: %w", err)
 	}
 	stats.TotalMessages = total
 
-	// Pending count (not retried)
+	// Pending count (not retried). Exact and index-backed: the non-sparse retried_at
+	// index serves this equality-on-null predicate via a COUNT_SCAN.
 	pending, err := s.collection.CountDocuments(ctx, bson.M{"retried_at": nil})
 	if err != nil {
 		return nil, fmt.Errorf("count pending: %w", err)
 	}
 	stats.PendingMessages = pending
-	stats.RetriedMessages = total - pending
+	// total is an estimate while pending is exact, so the subtraction can briefly go
+	// negative around concurrent writes; clamp to keep the reported figure sane.
+	if retried := total - pending; retried > 0 {
+		stats.RetriedMessages = retried
+	}
 
 	// Count by event using aggregation
 	eventPipeline := mongo.Pipeline{
@@ -618,8 +669,9 @@ func (s *MongoStore) Health(ctx context.Context) *health.Result {
 		}
 	}
 
-	// Get message count to include in health details
-	count, err := s.collection.CountDocuments(ctx, bson.M{})
+	// Get message count to include in health details. Uses the O(1) metadata count
+	// so a health probe never triggers a full collection scan.
+	count, err := s.collection.EstimatedDocumentCount(ctx)
 	if err != nil {
 		return &health.Result{
 			Status:    health.StatusUnhealthy,

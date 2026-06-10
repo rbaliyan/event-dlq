@@ -418,13 +418,20 @@ func (m *Manager) Count(ctx context.Context, filter Filter) (int64, error) {
 //	})
 //	log.Info("replayed messages", "count", replayed)
 func (m *Manager) Replay(ctx context.Context, filter Filter) (int, error) {
+	filter.ExcludeQuarantined = true // never re-evaluate quarantined messages
 	messages, err := m.store.List(ctx, filter)
 	if err != nil {
 		return 0, fmt.Errorf("list messages: %w", err)
 	}
 
 	replayed := 0
+	warnedTerminalNoQuarantine := false
 	for _, msg := range messages {
+		if m.isTerminal(msg) {
+			m.handleTerminal(ctx, msg, &warnedTerminalNoQuarantine)
+			continue
+		}
+
 		if err := m.replayMessageWithRetry(ctx, msg); err != nil {
 			m.logger.Error("failed to replay message",
 				"id", msg.ID,
@@ -455,6 +462,35 @@ func (m *Manager) Replay(ctx context.Context, filter Filter) (int, error) {
 	return replayed, nil
 }
 
+// isTerminal reports whether the message is a non-retryable failure per the
+// configured WithTerminalError predicate. Always false when no predicate is set.
+func (m *Manager) isTerminal(msg *Message) bool {
+	return m.terminalError != nil && m.terminalError(msg)
+}
+
+// handleTerminal quarantines a terminal message (if the store supports it) and
+// never republishes it. warnedOnce is set to true after the first warning when
+// the store does not support quarantine, to avoid per-message log spam within a
+// single Replay sweep.
+func (m *Manager) handleTerminal(ctx context.Context, msg *Message, warnedOnce *bool) {
+	q, ok := m.store.(Quarantiner)
+	if !ok {
+		if !*warnedOnce {
+			m.logger.Warn("terminal DLQ message but store does not support quarantine; skipping replay",
+				"id", msg.ID, "event", msg.EventName)
+			*warnedOnce = true
+		}
+		return
+	}
+	if err := q.Quarantine(ctx, msg.ID); err != nil {
+		m.logger.Error("failed to quarantine terminal message", "id", msg.ID, "error", err)
+		return
+	}
+	m.metrics.RecordQuarantined(ctx, msg.EventName)
+	m.logger.Info("quarantined terminal DLQ message",
+		"id", msg.ID, "event", msg.EventName, "error", msg.Error)
+}
+
 // ReplaySingle replays a single DLQ message by ID.
 //
 // If backoff and maxRetries are configured, the replay will be retried
@@ -463,6 +499,12 @@ func (m *Manager) ReplaySingle(ctx context.Context, id string) error {
 	msg, err := m.store.Get(ctx, id)
 	if err != nil {
 		return fmt.Errorf("get message: %w", err)
+	}
+
+	if m.isTerminal(msg) {
+		warned := false
+		m.handleTerminal(ctx, msg, &warned)
+		return nil
 	}
 
 	if err := m.replayMessageWithRetry(ctx, msg); err != nil {

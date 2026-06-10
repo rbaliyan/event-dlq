@@ -27,13 +27,15 @@ const (
 //   - dlq_messages_pending: Gauge of current pending messages in DLQ
 //   - dlq_replay_success_total: Counter of successful replays
 //   - dlq_replay_failure_total: Counter of failed replays
+//   - dlq_messages_quarantined_total: Counter of messages quarantined as terminal/non-retryable
 type Metrics struct {
-	messagesTotal         metric.Int64Counter
-	messagesReplayedTotal metric.Int64Counter
-	messagesDeletedTotal  metric.Int64Counter
-	messagesPending       metric.Int64UpDownCounter
-	replaySuccessTotal    metric.Int64Counter
-	replayFailureTotal    metric.Int64Counter
+	messagesTotal            metric.Int64Counter
+	messagesReplayedTotal    metric.Int64Counter
+	messagesDeletedTotal     metric.Int64Counter
+	messagesPending          metric.Int64UpDownCounter
+	replaySuccessTotal       metric.Int64Counter
+	replayFailureTotal       metric.Int64Counter
+	messagesQuarantinedTotal metric.Int64Counter
 
 	// pendingCounts tracks pending messages per event for gauge updates
 	pendingMu     sync.RWMutex
@@ -109,14 +111,23 @@ func NewMetricsWithProvider(provider metric.MeterProvider) (*Metrics, error) {
 		return nil, err
 	}
 
+	messagesQuarantinedTotal, err := meter.Int64Counter("dlq_messages_quarantined_total",
+		metric.WithDescription("Total messages quarantined as terminal/non-retryable"),
+		metric.WithUnit("{message}"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
 	return &Metrics{
-		messagesTotal:         messagesTotal,
-		messagesReplayedTotal: messagesReplayedTotal,
-		messagesDeletedTotal:  messagesDeletedTotal,
-		messagesPending:       messagesPending,
-		replaySuccessTotal:    replaySuccessTotal,
-		replayFailureTotal:    replayFailureTotal,
-		pendingCounts:         make(map[string]int64),
+		messagesTotal:            messagesTotal,
+		messagesReplayedTotal:    messagesReplayedTotal,
+		messagesDeletedTotal:     messagesDeletedTotal,
+		messagesPending:          messagesPending,
+		replaySuccessTotal:       replaySuccessTotal,
+		replayFailureTotal:       replayFailureTotal,
+		messagesQuarantinedTotal: messagesQuarantinedTotal,
+		pendingCounts:            make(map[string]int64),
 	}, nil
 }
 
@@ -218,6 +229,20 @@ func (m *Metrics) RecordReplayFailure(ctx context.Context, eventName, errorType 
 	}
 
 	m.replayFailureTotal.Add(ctx, 1, metric.WithAttributes(attrs...))
+}
+
+// RecordQuarantined records that a terminal message was quarantined.
+// Increments dlq_messages_quarantined_total.
+func (m *Metrics) RecordQuarantined(ctx context.Context, eventName string) {
+	if m == nil {
+		return
+	}
+
+	attrs := []attribute.KeyValue{
+		attribute.String("event", eventName),
+	}
+
+	m.messagesQuarantinedTotal.Add(ctx, 1, metric.WithAttributes(attrs...))
 }
 
 // SyncPendingCount synchronizes the pending count for an event.

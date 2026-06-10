@@ -182,13 +182,14 @@ type Store interface {
 //
 // Used for monitoring and alerting on DLQ health.
 type Stats struct {
-	TotalMessages   int64            // Total messages in DLQ
-	MessagesByEvent map[string]int64 // Count per event type
-	MessagesByError map[string]int64 // Count per error type
-	OldestMessage   *time.Time       // Timestamp of oldest message
-	NewestMessage   *time.Time       // Timestamp of newest message
-	RetriedMessages int64            // Messages that have been replayed
-	PendingMessages int64            // Messages awaiting replay
+	TotalMessages       int64            // Total messages in DLQ
+	MessagesByEvent     map[string]int64 // Count per event type
+	MessagesByError     map[string]int64 // Count per error type
+	OldestMessage       *time.Time       // Timestamp of oldest message
+	NewestMessage       *time.Time       // Timestamp of newest message
+	RetriedMessages     int64            // Messages that have been replayed
+	PendingMessages     int64            // Messages awaiting replay
+	QuarantinedMessages int64            // Messages quarantined as terminal (non-retryable)
 }
 
 // StatsProvider is an optional interface for stores that support statistics.

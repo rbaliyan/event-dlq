@@ -55,47 +55,50 @@ db.event_dlq.createIndex({ "event_name": 1, "created_at": 1 })
 
 // mongoMessage represents a DLQ message document in MongoDB
 type mongoMessage struct {
-	ID         string            `bson:"_id"`
-	EventName  string            `bson:"event_name"`
-	OriginalID string            `bson:"original_id"`
-	Payload    []byte            `bson:"payload"`
-	Metadata   map[string]string `bson:"metadata,omitempty"`
-	Error      string            `bson:"error"`
-	RetryCount int               `bson:"retry_count"`
-	Source     string            `bson:"source,omitempty"`
-	CreatedAt  time.Time         `bson:"created_at"`
-	RetriedAt  *time.Time        `bson:"retried_at,omitempty"`
+	ID            string            `bson:"_id"`
+	EventName     string            `bson:"event_name"`
+	OriginalID    string            `bson:"original_id"`
+	Payload       []byte            `bson:"payload"`
+	Metadata      map[string]string `bson:"metadata,omitempty"`
+	Error         string            `bson:"error"`
+	RetryCount    int               `bson:"retry_count"`
+	Source        string            `bson:"source,omitempty"`
+	CreatedAt     time.Time         `bson:"created_at"`
+	RetriedAt     *time.Time        `bson:"retried_at,omitempty"`
+	QuarantinedAt *time.Time        `bson:"quarantined_at,omitempty"`
 }
 
 // toMessage converts mongoMessage to Message
 func (m *mongoMessage) toMessage() *Message {
 	return &Message{
-		ID:         m.ID,
-		EventName:  m.EventName,
-		OriginalID: m.OriginalID,
-		Payload:    m.Payload,
-		Metadata:   m.Metadata,
-		Error:      m.Error,
-		RetryCount: m.RetryCount,
-		Source:     m.Source,
-		CreatedAt:  m.CreatedAt,
-		RetriedAt:  m.RetriedAt,
+		ID:            m.ID,
+		EventName:     m.EventName,
+		OriginalID:    m.OriginalID,
+		Payload:       m.Payload,
+		Metadata:      m.Metadata,
+		Error:         m.Error,
+		RetryCount:    m.RetryCount,
+		Source:        m.Source,
+		CreatedAt:     m.CreatedAt,
+		RetriedAt:     m.RetriedAt,
+		QuarantinedAt: m.QuarantinedAt,
 	}
 }
 
 // fromMessage creates a mongoMessage from Message
 func fromMessage(m *Message) *mongoMessage {
 	return &mongoMessage{
-		ID:         m.ID,
-		EventName:  m.EventName,
-		OriginalID: m.OriginalID,
-		Payload:    m.Payload,
-		Metadata:   m.Metadata,
-		Error:      m.Error,
-		RetryCount: m.RetryCount,
-		Source:     m.Source,
-		CreatedAt:  m.CreatedAt,
-		RetriedAt:  m.RetriedAt,
+		ID:            m.ID,
+		EventName:     m.EventName,
+		OriginalID:    m.OriginalID,
+		Payload:       m.Payload,
+		Metadata:      m.Metadata,
+		Error:         m.Error,
+		RetryCount:    m.RetryCount,
+		Source:        m.Source,
+		CreatedAt:     m.CreatedAt,
+		RetriedAt:     m.RetriedAt,
+		QuarantinedAt: m.QuarantinedAt,
 	}
 }
 
@@ -457,6 +460,10 @@ func (s *MongoStore) buildFilter(filter Filter) bson.M {
 		mongoFilter["retried_at"] = nil
 	}
 
+	if filter.ExcludeQuarantined {
+		mongoFilter["quarantined_at"] = nil
+	}
+
 	return mongoFilter
 }
 
@@ -473,6 +480,28 @@ func (s *MongoStore) MarkRetried(ctx context.Context, id string) error {
 	result, err := s.collection.UpdateOne(ctx, filter, update)
 	if err != nil {
 		return fmt.Errorf("update: %w", err)
+	}
+
+	if result.MatchedCount == 0 {
+		return fmt.Errorf("%s: %w", id, ErrNotFound)
+	}
+
+	return nil
+}
+
+// Quarantine marks a message as a terminal, non-retryable failure.
+func (s *MongoStore) Quarantine(ctx context.Context, id string) error {
+	now := time.Now()
+	filter := bson.M{"_id": id}
+	update := bson.M{
+		"$set": bson.M{
+			"quarantined_at": now,
+		},
+	}
+
+	result, err := s.collection.UpdateOne(ctx, filter, update)
+	if err != nil {
+		return fmt.Errorf("quarantine: %w", err)
 	}
 
 	if result.MatchedCount == 0 {
@@ -701,3 +730,4 @@ func (s *MongoStore) Health(ctx context.Context) *health.Result {
 var _ Store = (*MongoStore)(nil)
 var _ StatsProvider = (*MongoStore)(nil)
 var _ health.Checker = (*MongoStore)(nil)
+var _ Quarantiner = (*MongoStore)(nil)

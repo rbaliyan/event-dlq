@@ -116,6 +116,7 @@ type MongoStoreOption func(*mongoStoreOptions)
 
 type mongoStoreOptions struct {
 	collection string
+	dedup      bool
 }
 
 // WithCollection sets a custom collection name.
@@ -127,9 +128,18 @@ func WithCollection(name string) MongoStoreOption {
 	}
 }
 
+// WithMongoDedup enables upsert-on-(EventName, OriginalID): re-storing a message
+// with the same event name and (non-empty) original ID increments retry_count on
+// the existing document instead of inserting a new one. Default: off (backward
+// compatible — existing callers see no change).
+func WithMongoDedup() MongoStoreOption {
+	return func(o *mongoStoreOptions) { o.dedup = true }
+}
+
 // MongoStore is a MongoDB-based DLQ store
 type MongoStore struct {
 	collection *mongo.Collection
+	dedup      bool        // Whether dedup upsert is enabled (off by default)
 	cappedMu   sync.Mutex  // Protects capped fields
 	cappedDone bool        // Whether capped info has been fetched
 	cappedInfo *cappedInfo // Cached capped info (nil = not checked yet)
@@ -152,6 +162,7 @@ func NewMongoStore(db *mongo.Database, opts ...MongoStoreOption) (*MongoStore, e
 
 	s := &MongoStore{
 		collection: db.Collection(o.collection),
+		dedup:      o.dedup,
 	}
 	go func() { // #nosec G118 — background goroutine intentionally outlives constructor context
 		if err := s.EnsureIndexes(context.Background()); err != nil {
@@ -203,12 +214,32 @@ func (s *MongoStore) Indexes() []mongo.IndexModel {
 // index, which cannot serve {retried_at: nil} queries (pending messages omit the
 // field) and conflicts with the non-sparse definition this version creates. Any
 // pre-existing sparse retried_at index is dropped first so it can be recreated.
+//
+// When dedup is enabled, a unique index on (event_name, original_id) is created
+// in a separate, failure-tolerant step. If the collection still contains legacy
+// duplicate pairs the index creation will fail; run MigrateDedup to collapse
+// duplicates first, then call EnsureIndexes again.
 func (s *MongoStore) EnsureIndexes(ctx context.Context) error {
 	if err := s.dropLegacySparseRetriedIndex(ctx); err != nil {
 		return err
 	}
-	_, err := s.collection.Indexes().CreateMany(ctx, s.Indexes())
-	return err
+	if _, err := s.collection.Indexes().CreateMany(ctx, s.Indexes()); err != nil {
+		return err
+	}
+
+	// Unique dedup index on (event_name, original_id). Created best-effort:
+	// on a collection that still contains legacy duplicates this fails, which is
+	// expected — callers run MigrateDedup to collapse duplicates first. A failure
+	// here must NOT break index bootstrap, so we log and continue.
+	uniqModel := mongo.IndexModel{
+		Keys:    bson.D{{Key: "event_name", Value: 1}, {Key: "original_id", Value: 1}},
+		Options: options.Index().SetUnique(true).SetName("uniq_event_original"),
+	}
+	if _, err := s.collection.Indexes().CreateOne(ctx, uniqModel); err != nil {
+		slog.Default().Warn("dlq: unique dedup index not created (legacy duplicates?); run MigrateDedup",
+			"collection", s.collection.Name(), "error", err)
+	}
+	return nil
 }
 
 // dropLegacySparseRetriedIndex removes a pre-existing sparse retried_at_1 index so
@@ -347,7 +378,10 @@ func (s *MongoStore) CreateCapped(ctx context.Context, sizeBytes int64, maxDocs 
 	return nil
 }
 
-// Store adds a message to the DLQ
+// Store adds a message to the DLQ. When dedup is enabled and msg.OriginalID is
+// non-empty, a duplicate (EventName, OriginalID) pair upserts the existing
+// document: RetryCount is incremented, Error/Payload/Metadata are updated to the
+// latest values, RetriedAt is cleared, and CreatedAt is preserved as first-seen.
 func (s *MongoStore) Store(ctx context.Context, msg *Message) error {
 	if msg == nil {
 		return fmt.Errorf("message is nil")
@@ -355,17 +389,48 @@ func (s *MongoStore) Store(ctx context.Context, msg *Message) error {
 	if msg.ID == "" {
 		return fmt.Errorf("message ID is required")
 	}
-
-	mongoMsg := fromMessage(msg)
-
-	_, err := s.collection.InsertOne(ctx, mongoMsg)
-	if err != nil {
+	if s.dedup && msg.OriginalID != "" {
+		return s.upsertDedup(ctx, msg)
+	}
+	doc := fromMessage(msg)
+	if _, err := s.collection.InsertOne(ctx, doc); err != nil {
 		if mongo.IsDuplicateKeyError(err) {
 			return fmt.Errorf("message already exists: %s", msg.ID)
 		}
 		return fmt.Errorf("insert: %w", err)
 	}
+	return nil
+}
 
+// upsertDedup collapses re-stores of the same (event_name, original_id) into one
+// document: increments retry_count, updates error/payload/metadata to the latest,
+// preserves the first-seen created_at, and clears retried_at. Uses an aggregation
+// pipeline so the same retry_count field can be initialized on insert and
+// incremented on update without a conflicting-operator error.
+func (s *MongoStore) upsertDedup(ctx context.Context, msg *Message) error {
+	filter := bson.M{"event_name": msg.EventName, "original_id": msg.OriginalID}
+	pipeline := mongo.Pipeline{
+		bson.D{{Key: "$set", Value: bson.M{
+			"retry_count": bson.M{"$cond": bson.A{
+				bson.M{"$eq": bson.A{bson.M{"$type": "$retry_count"}, "missing"}},
+				msg.RetryCount,
+				bson.M{"$add": bson.A{"$retry_count", 1}},
+			}},
+			"_id":         bson.M{"$ifNull": bson.A{"$_id", msg.ID}},
+			"event_name":  msg.EventName,
+			"original_id": msg.OriginalID,
+			"error":       msg.Error,
+			"payload":     msg.Payload,
+			"metadata":    msg.Metadata,
+			"source":      bson.M{"$ifNull": bson.A{"$source", msg.Source}},
+			"created_at":  bson.M{"$ifNull": bson.A{"$created_at", msg.CreatedAt}},
+			"retried_at":  nil,
+		}}},
+	}
+	opts := options.UpdateOne().SetUpsert(true)
+	if _, err := s.collection.UpdateOne(ctx, filter, mongo.Pipeline(pipeline), opts); err != nil {
+		return fmt.Errorf("upsert dedup: %w", err)
+	}
 	return nil
 }
 

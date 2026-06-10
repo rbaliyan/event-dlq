@@ -246,6 +246,78 @@ func TestPostgresStoreIntegration(t *testing.T) {
 	runStoreContractTests(t, store)
 }
 
+func TestMongoStoreDedup(t *testing.T) {
+	client := getMongoClient(t)
+	ctx := context.Background()
+
+	dbName := "dlq_dedup_test_" + time.Now().Format("20060102150405")
+	db := client.Database(dbName)
+	t.Cleanup(func() { db.Drop(context.Background()) })
+
+	// dedup OFF => two distinct docs
+	off, err := NewMongoStore(db, WithCollection("dlq_dedup_off_test"))
+	if err != nil {
+		t.Fatalf("NewMongoStore (off): %v", err)
+	}
+	_ = off.Collection().Drop(ctx)
+	t.Cleanup(func() { _ = off.Collection().Drop(ctx) })
+	_ = off.Store(ctx, &Message{ID: "a", EventName: "e", OriginalID: "o1", CreatedAt: time.Now()})
+	_ = off.Store(ctx, &Message{ID: "b", EventName: "e", OriginalID: "o1", CreatedAt: time.Now()})
+	if n, _ := off.Count(ctx, Filter{}); n != 2 {
+		t.Fatalf("dedup off: want 2, got %d", n)
+	}
+
+	// dedup ON => upsert
+	on, err := NewMongoStore(db, WithCollection("dlq_dedup_on_test"), WithMongoDedup())
+	if err != nil {
+		t.Fatalf("NewMongoStore (on): %v", err)
+	}
+	_ = on.Collection().Drop(ctx)
+	t.Cleanup(func() { _ = on.Collection().Drop(ctx) })
+	if err := on.EnsureIndexes(ctx); err != nil {
+		t.Fatalf("EnsureIndexes: %v", err)
+	}
+	first := time.Now().Add(-time.Hour).Truncate(time.Millisecond)
+	_ = on.Store(ctx, &Message{ID: "a", EventName: "e", OriginalID: "o1", Error: "err1", RetryCount: 3, CreatedAt: first})
+	_ = on.Store(ctx, &Message{ID: "b", EventName: "e", OriginalID: "o1", Error: "err2", RetryCount: 0, CreatedAt: time.Now()})
+	if n, _ := on.Count(ctx, Filter{}); n != 1 {
+		t.Fatalf("dedup on: want 1, got %d", n)
+	}
+	list, err := on.List(ctx, Filter{})
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(list) == 0 {
+		t.Fatal("list returned no messages")
+	}
+	g := list[0]
+	if g.RetryCount != 4 {
+		t.Fatalf("retry_count: want 4, got %d", g.RetryCount)
+	}
+	if g.Error != "err2" {
+		t.Fatalf("error latest: want err2, got %q", g.Error)
+	}
+	if !g.CreatedAt.UTC().Equal(first.UTC()) {
+		t.Fatalf("created_at preserved: want %v, got %v", first.UTC(), g.CreatedAt.UTC())
+	}
+	if g.RetriedAt != nil {
+		t.Fatal("retried_at must be nil after upsert")
+	}
+
+	// empty OriginalID => distinct under dedup
+	on2, err := NewMongoStore(db, WithCollection("dlq_dedup_empty_test"), WithMongoDedup())
+	if err != nil {
+		t.Fatalf("NewMongoStore (on2): %v", err)
+	}
+	_ = on2.Collection().Drop(ctx)
+	t.Cleanup(func() { _ = on2.Collection().Drop(ctx) })
+	_ = on2.Store(ctx, &Message{ID: "a", EventName: "e", OriginalID: "", CreatedAt: time.Now()})
+	_ = on2.Store(ctx, &Message{ID: "b", EventName: "e", OriginalID: "", CreatedAt: time.Now()})
+	if n, _ := on2.Count(ctx, Filter{}); n != 2 {
+		t.Fatalf("empty original under dedup: want 2, got %d", n)
+	}
+}
+
 func TestMongoStoreQuarantine(t *testing.T) {
 	client := getMongoClient(t)
 	ctx := context.Background()

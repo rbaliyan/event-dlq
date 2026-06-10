@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"time"
 
+	"github.com/lib/pq"
 	"github.com/rbaliyan/event/v3/health"
 	"github.com/rbaliyan/event/v3/store/base"
 )
@@ -186,6 +187,10 @@ func (s *PostgresStore) Store(ctx context.Context, msg *Message) error {
 		return fmt.Errorf("marshal metadata: %w", err)
 	}
 
+	if s.dedup && msg.OriginalID != "" {
+		return s.storeDedup(ctx, msg, metadata)
+	}
+
 	// #nosec G201 -- table name is set at construction, not user input
 	query := fmt.Sprintf(`
 		INSERT INTO %s (id, event_name, original_id, payload, metadata, error, retry_count, source, created_at)
@@ -209,6 +214,69 @@ func (s *PostgresStore) Store(ctx context.Context, msg *Message) error {
 	}
 
 	return nil
+}
+
+// storeDedup upserts on (event_name, original_id): increments retry_count,
+// updates error/payload/metadata to the latest, preserves created_at (first-seen),
+// and clears retried_at. Prefers the native ON CONFLICT path; if the unique
+// constraint is not present yet (upgraded-but-unmigrated table), it falls back to
+// a transactional SELECT ... FOR UPDATE upsert so writes never fail.
+// #nosec G201 -- table name is set at construction, not user input
+func (s *PostgresStore) storeDedup(ctx context.Context, msg *Message, metadata []byte) error {
+	upsert := fmt.Sprintf(`
+		INSERT INTO %s (id, event_name, original_id, payload, metadata, error, retry_count, source, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		ON CONFLICT (event_name, original_id) DO UPDATE SET
+			retry_count = %s.retry_count + 1,
+			error       = EXCLUDED.error,
+			payload     = EXCLUDED.payload,
+			metadata    = EXCLUDED.metadata,
+			retried_at  = NULL
+	`, s.table, s.table)
+
+	_, err := s.db.ExecContext(ctx, upsert,
+		msg.ID, msg.EventName, msg.OriginalID, msg.Payload, metadata,
+		msg.Error, msg.RetryCount, msg.Source, msg.CreatedAt)
+	if err == nil {
+		return nil
+	}
+	var pqErr *pq.Error
+	if errors.As(err, &pqErr) && string(pqErr.Code) == "42P10" {
+		return s.storeDedupFallback(ctx, msg, metadata)
+	}
+	return fmt.Errorf("upsert: %w", err)
+}
+
+// storeDedupFallback performs dedup when no unique constraint exists yet, using
+// SELECT ... FOR UPDATE within a transaction so concurrent stores serialize.
+// #nosec G201 -- table name is set at construction, not user input
+func (s *PostgresStore) storeDedupFallback(ctx context.Context, msg *Message, metadata []byte) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	sel := fmt.Sprintf("SELECT id FROM %s WHERE event_name=$1 AND original_id=$2 ORDER BY created_at LIMIT 1 FOR UPDATE", s.table)
+	var existingID string
+	err = tx.QueryRowContext(ctx, sel, msg.EventName, msg.OriginalID).Scan(&existingID)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		ins := fmt.Sprintf(`INSERT INTO %s (id, event_name, original_id, payload, metadata, error, retry_count, source, created_at)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`, s.table)
+		if _, err = tx.ExecContext(ctx, ins, msg.ID, msg.EventName, msg.OriginalID, msg.Payload,
+			metadata, msg.Error, msg.RetryCount, msg.Source, msg.CreatedAt); err != nil {
+			return fmt.Errorf("fallback insert: %w", err)
+		}
+	case err != nil:
+		return fmt.Errorf("fallback select: %w", err)
+	default:
+		upd := fmt.Sprintf(`UPDATE %s SET retry_count = retry_count + 1, error=$1, payload=$2, metadata=$3, retried_at=NULL WHERE id=$4`, s.table)
+		if _, err = tx.ExecContext(ctx, upd, msg.Error, msg.Payload, metadata, existingID); err != nil {
+			return fmt.Errorf("fallback update: %w", err)
+		}
+	}
+	return tx.Commit()
 }
 
 // Get retrieves a single message by ID

@@ -480,6 +480,59 @@ func TestMongoStoreQuarantine(t *testing.T) {
 	}
 }
 
+func TestPostgresStoreDedup(t *testing.T) {
+	db := getPostgresDB(t)
+	ctx := context.Background()
+
+	// dedup OFF: two rows for same (event, original)
+	off, _ := NewPostgresStore(db, WithTable("dlq_pg_dedup_off"))
+	_, _ = db.ExecContext(ctx, "DROP TABLE IF EXISTS dlq_pg_dedup_off")
+	_ = off.EnsureTable(ctx)
+	t.Cleanup(func() { _, _ = db.ExecContext(ctx, "DROP TABLE IF EXISTS dlq_pg_dedup_off") })
+	_ = off.Store(ctx, &Message{ID: "a", EventName: "e", OriginalID: "o1", Payload: []byte{}, Error: "x", CreatedAt: time.Now()})
+	_ = off.Store(ctx, &Message{ID: "b", EventName: "e", OriginalID: "o1", Payload: []byte{}, Error: "x", CreatedAt: time.Now()})
+	if n, _ := off.Count(ctx, Filter{}); n != 2 {
+		t.Fatalf("dedup off: want 2, got %d", n)
+	}
+
+	// dedup ON with unique index (created by EnsureTable): upsert via ON CONFLICT
+	on, _ := NewPostgresStore(db, WithTable("dlq_pg_dedup_on"), WithPostgresDedup())
+	_, _ = db.ExecContext(ctx, "DROP TABLE IF EXISTS dlq_pg_dedup_on")
+	_ = on.EnsureTable(ctx)
+	t.Cleanup(func() { _, _ = db.ExecContext(ctx, "DROP TABLE IF EXISTS dlq_pg_dedup_on") })
+	first := time.Now().Add(-time.Hour)
+	_ = on.Store(ctx, &Message{ID: "a", EventName: "e", OriginalID: "o1", Payload: []byte{}, Error: "err1", RetryCount: 3, CreatedAt: first})
+	_ = on.Store(ctx, &Message{ID: "b", EventName: "e", OriginalID: "o1", Payload: []byte{}, Error: "err2", RetryCount: 0, CreatedAt: time.Now()})
+	if n, _ := on.Count(ctx, Filter{}); n != 1 {
+		t.Fatalf("dedup on: want 1, got %d", n)
+	}
+	g, _ := on.GetByOriginalID(ctx, "o1")
+	if g.RetryCount != 4 {
+		t.Fatalf("retry_count: want 4, got %d", g.RetryCount)
+	}
+	if g.Error != "err2" {
+		t.Fatalf("error latest: want err2, got %q", g.Error)
+	}
+
+	// dedup ON but NO unique constraint (drop it) => fallback path still upserts
+	nc, _ := NewPostgresStore(db, WithTable("dlq_pg_dedup_noidx"), WithPostgresDedup())
+	_, _ = db.ExecContext(ctx, "DROP TABLE IF EXISTS dlq_pg_dedup_noidx")
+	_ = nc.EnsureTable(ctx)
+	_, _ = db.ExecContext(ctx, "DROP INDEX IF EXISTS uniq_dlq_pg_dedup_noidx_event_original")
+	t.Cleanup(func() { _, _ = db.ExecContext(ctx, "DROP TABLE IF EXISTS dlq_pg_dedup_noidx") })
+	_ = nc.Store(ctx, &Message{ID: "a", EventName: "e", OriginalID: "o9", Payload: []byte{}, Error: "f1", RetryCount: 1, CreatedAt: time.Now()})
+	if err := nc.Store(ctx, &Message{ID: "b", EventName: "e", OriginalID: "o9", Payload: []byte{}, Error: "f2", RetryCount: 0, CreatedAt: time.Now()}); err != nil {
+		t.Fatalf("fallback upsert must not error without constraint: %v", err)
+	}
+	if n, _ := nc.Count(ctx, Filter{}); n != 1 {
+		t.Fatalf("fallback dedup: want 1 row, got %d", n)
+	}
+	g2, _ := nc.GetByOriginalID(ctx, "o9")
+	if g2.RetryCount != 2 {
+		t.Fatalf("fallback retry_count: want 2, got %d", g2.RetryCount)
+	}
+}
+
 func TestPostgresStoreQuarantine(t *testing.T) {
 	db := getPostgresDB(t)
 	ctx := context.Background()

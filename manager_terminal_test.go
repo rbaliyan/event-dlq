@@ -52,6 +52,31 @@ func TestReplay_QuarantinesTerminalAndDoesNotRepublish(t *testing.T) {
 	}
 }
 
+func TestReplaySingle_QuarantinesTerminal(t *testing.T) {
+	ctx := context.Background()
+	store := NewMemoryStore()
+	_ = store.Store(ctx, &Message{
+		ID: "poison", EventName: "call.updated.GLOBAL", OriginalID: "orig-1",
+		Error: "cannot decode string into a call.EndReason",
+	})
+	rep := &countingRepublisher{}
+	mgr, err := NewManager(store, rep, WithTerminalError(TerminalErrorMatching("cannot decode")))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+
+	if err := mgr.ReplaySingle(ctx, "poison"); err != nil {
+		t.Fatalf("ReplaySingle: unexpected error: %v", err)
+	}
+	if rep.sends != 0 {
+		t.Fatalf("terminal message must not be republished; Send called %d times", rep.sends)
+	}
+	got, _ := store.Get(ctx, "poison")
+	if got.QuarantinedAt == nil {
+		t.Fatal("expected terminal message to be quarantined")
+	}
+}
+
 func TestTerminalErrorMatching(t *testing.T) {
 	pred := TerminalErrorMatching("cannot decode", "unmarshal")
 

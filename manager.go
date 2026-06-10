@@ -425,10 +425,20 @@ func (m *Manager) Replay(ctx context.Context, filter Filter) (int, error) {
 	}
 
 	replayed := 0
-	warnedTerminalNoQuarantine := false
+	warnedNoQuarantine := false
 	for _, msg := range messages {
 		if m.isTerminal(msg) {
-			m.handleTerminal(ctx, msg, &warnedTerminalNoQuarantine)
+			if err := m.quarantineTerminal(ctx, msg); err != nil {
+				if errors.Is(err, errStoreNotQuarantiner) {
+					if !warnedNoQuarantine {
+						m.logger.Warn("terminal DLQ message but store does not support quarantine; skipping replay",
+							"id", msg.ID, "event", msg.EventName)
+						warnedNoQuarantine = true
+					}
+				} else {
+					m.logger.Error("failed to quarantine terminal message", "id", msg.ID, "error", err)
+				}
+			}
 			continue
 		}
 
@@ -462,33 +472,31 @@ func (m *Manager) Replay(ctx context.Context, filter Filter) (int, error) {
 	return replayed, nil
 }
 
+// errStoreNotQuarantiner indicates the configured store does not implement
+// Quarantiner, so terminal messages cannot be persistently quarantined.
+var errStoreNotQuarantiner = errors.New("dlq: store does not support quarantine")
+
 // isTerminal reports whether the message is a non-retryable failure per the
 // configured WithTerminalError predicate. Always false when no predicate is set.
 func (m *Manager) isTerminal(msg *Message) bool {
 	return m.terminalError != nil && m.terminalError(msg)
 }
 
-// handleTerminal quarantines a terminal message (if the store supports it) and
-// never republishes it. warnedOnce is set to true after the first warning when
-// the store does not support quarantine, to avoid per-message log spam within a
-// single Replay sweep.
-func (m *Manager) handleTerminal(ctx context.Context, msg *Message, warnedOnce *bool) {
+// quarantineTerminal quarantines a terminal message. It returns
+// errStoreNotQuarantiner if the store does not implement Quarantiner, or the
+// underlying store error if the quarantine write fails.
+func (m *Manager) quarantineTerminal(ctx context.Context, msg *Message) error {
 	q, ok := m.store.(Quarantiner)
 	if !ok {
-		if !*warnedOnce {
-			m.logger.Warn("terminal DLQ message but store does not support quarantine; skipping replay",
-				"id", msg.ID, "event", msg.EventName)
-			*warnedOnce = true
-		}
-		return
+		return errStoreNotQuarantiner
 	}
 	if err := q.Quarantine(ctx, msg.ID); err != nil {
-		m.logger.Error("failed to quarantine terminal message", "id", msg.ID, "error", err)
-		return
+		return fmt.Errorf("quarantine %s: %w", msg.ID, err)
 	}
 	m.metrics.RecordQuarantined(ctx, msg.EventName)
 	m.logger.Info("quarantined terminal DLQ message",
 		"id", msg.ID, "event", msg.EventName, "error", msg.Error)
+	return nil
 }
 
 // ReplaySingle replays a single DLQ message by ID.
@@ -502,9 +510,7 @@ func (m *Manager) ReplaySingle(ctx context.Context, id string) error {
 	}
 
 	if m.isTerminal(msg) {
-		warned := false
-		m.handleTerminal(ctx, msg, &warned)
-		return nil
+		return m.quarantineTerminal(ctx, msg)
 	}
 
 	if err := m.replayMessageWithRetry(ctx, msg); err != nil {

@@ -533,6 +533,89 @@ func TestPostgresStoreDedup(t *testing.T) {
 	}
 }
 
+func TestPostgresStoreMigrateDedup(t *testing.T) {
+	db := getPostgresDB(t)
+	ctx := context.Background()
+	store, _ := NewPostgresStore(db, WithTable("dlq_pg_migrate"), WithPostgresDedup())
+	_, _ = db.ExecContext(ctx, "DROP TABLE IF EXISTS dlq_pg_migrate")
+	_ = store.EnsureTable(ctx)
+	// Drop the unique index so we can seed duplicates directly.
+	_, _ = db.ExecContext(ctx, "DROP INDEX IF EXISTS uniq_dlq_pg_migrate_event_original")
+	t.Cleanup(func() { _, _ = db.ExecContext(ctx, "DROP TABLE IF EXISTS dlq_pg_migrate") })
+
+	old := time.Now().Add(-2 * time.Hour)
+	mid := time.Now().Add(-time.Hour)
+	newest := time.Now()
+	seed := func(id string, rc int, ts time.Time) {
+		_, err := db.ExecContext(ctx,
+			"INSERT INTO dlq_pg_migrate (id,event_name,original_id,payload,metadata,error,retry_count,source,created_at) VALUES ($1,'e','o1',$2,'{}','x',$3,'s',$4)",
+			id, []byte{}, rc, ts)
+		if err != nil {
+			t.Fatalf("seed %s: %v", id, err)
+		}
+	}
+	seed("d1", 1, mid)
+	seed("d2", 2, old)
+	seed("d3", 3, newest)
+	// one unique (e,o2)
+	_, _ = db.ExecContext(ctx, "INSERT INTO dlq_pg_migrate (id,event_name,original_id,payload,metadata,error,retry_count,source,created_at) VALUES ('u1','e','o2',$1,'{}','x',5,'s',$2)", []byte{}, newest)
+
+	// 2 of 4 deleted = 50%, allowed without force
+	removed, err := store.MigrateDedup(ctx)
+	if err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	if removed != 2 {
+		t.Fatalf("want 2 removed, got %d", removed)
+	}
+	g, err := store.GetByOriginalID(ctx, "o1")
+	if err != nil {
+		t.Fatalf("survivor: %v", err)
+	}
+	if g.ID != "d3" {
+		t.Fatalf("want newest d3 kept, got %s", g.ID)
+	}
+	if g.RetryCount != 6 {
+		t.Fatalf("want summed retry_count 6, got %d", g.RetryCount)
+	}
+	if n, _ := store.Count(ctx, Filter{}); n != 2 {
+		t.Fatalf("want 2 rows total, got %d", n)
+	}
+	// Unique index now present: a raw duplicate insert must fail.
+	_, err = db.ExecContext(ctx, "INSERT INTO dlq_pg_migrate (id,event_name,original_id,payload,metadata,error,retry_count,source,created_at) VALUES ('dup','e','o1',$1,'{}','x',0,'s',$2)", []byte{}, newest)
+	if err == nil {
+		t.Fatal("expected duplicate-key violation after unique index created")
+	}
+}
+
+func TestPostgresStoreMigrateDedup_ForceGuard(t *testing.T) {
+	db := getPostgresDB(t)
+	ctx := context.Background()
+	store, _ := NewPostgresStore(db, WithTable("dlq_pg_migrate_guard"), WithPostgresDedup())
+	_, _ = db.ExecContext(ctx, "DROP TABLE IF EXISTS dlq_pg_migrate_guard")
+	_ = store.EnsureTable(ctx)
+	_, _ = db.ExecContext(ctx, "DROP INDEX IF EXISTS uniq_dlq_pg_migrate_guard_event_original")
+	t.Cleanup(func() { _, _ = db.ExecContext(ctx, "DROP TABLE IF EXISTS dlq_pg_migrate_guard") })
+
+	for i := 0; i < 4; i++ {
+		_, err := db.ExecContext(ctx,
+			"INSERT INTO dlq_pg_migrate_guard (id,event_name,original_id,payload,metadata,error,retry_count,source,created_at) VALUES ($1,'e','o1',$2,'{}','x',1,'s',$3)",
+			fmt.Sprintf("d%d", i), []byte{}, time.Now())
+		if err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+	}
+	if _, err := store.MigrateDedup(ctx); err == nil {
+		t.Fatal("expected guard error at >50% deletion")
+	}
+	if _, err := store.MigrateDedup(ctx, WithForce()); err != nil {
+		t.Fatalf("force: %v", err)
+	}
+	if n, _ := store.Count(ctx, Filter{}); n != 1 {
+		t.Fatalf("after force want 1, got %d", n)
+	}
+}
+
 func TestPostgresStoreQuarantine(t *testing.T) {
 	db := getPostgresDB(t)
 	ctx := context.Background()

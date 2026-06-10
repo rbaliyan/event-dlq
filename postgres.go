@@ -661,6 +661,106 @@ func (s *PostgresStore) Health(ctx context.Context) *health.Result {
 	}
 }
 
+// MigrateDedup collapses historical duplicate (event_name, original_id) rows into
+// a single row (keeps the newest by created_at; sums retry_count; sets created_at
+// to the oldest; keeps the earliest quarantined_at), then creates the unique index
+// concurrently. It refuses to delete more than 50% of all rows unless WithForce is
+// given. Returns the number of rows removed. Idempotent.
+// #nosec G201 -- table name is set at construction, not user input
+func (s *PostgresStore) MigrateDedup(ctx context.Context, opts ...MigrateDedupOption) (int64, error) {
+	o := applyMigrateDedupOptions(opts)
+
+	var total int64
+	if err := s.db.QueryRowContext(ctx, fmt.Sprintf("SELECT COUNT(*) FROM %s", s.table)).Scan(&total); err != nil {
+		return 0, fmt.Errorf("count total: %w", err)
+	}
+	var toDelete int64
+	countDel := fmt.Sprintf(`
+		SELECT COALESCE(COUNT(*) - COUNT(DISTINCT (event_name, original_id)), 0)
+		FROM %s WHERE original_id <> ''`, s.table)
+	if err := s.db.QueryRowContext(ctx, countDel).Scan(&toDelete); err != nil {
+		return 0, fmt.Errorf("count duplicates: %w", err)
+	}
+	if !o.force && total > 0 && toDelete*2 > total {
+		return 0, fmt.Errorf("dlq: MigrateDedup would delete %d of %d rows (>50%%); pass WithForce to proceed", toDelete, total)
+	}
+	if toDelete == 0 {
+		// Nothing to collapse; still ensure the unique index exists.
+		if err := s.createUniqueIndexConcurrently(ctx); err != nil {
+			return 0, err
+		}
+		return 0, nil
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// Single-pass: compute ranks + aggregates once, then UPDATE survivors and
+	// DELETE duplicates in two separate statements that both reference the same
+	// pre-computed ranking (stored in a temp table so the ranking is frozen
+	// before the UPDATE mutates created_at).
+	createTmp := fmt.Sprintf(`
+		CREATE TEMP TABLE _dlq_dedup_work ON COMMIT DROP AS
+		SELECT id,
+			row_number() OVER (PARTITION BY event_name, original_id ORDER BY created_at DESC, id) AS rn,
+			SUM(retry_count)    OVER (PARTITION BY event_name, original_id) AS sum_retry,
+			MIN(created_at)     OVER (PARTITION BY event_name, original_id) AS min_created,
+			MIN(quarantined_at) OVER (PARTITION BY event_name, original_id) AS min_quar
+		FROM %s WHERE original_id <> ''`, s.table)
+	if _, err := tx.ExecContext(ctx, createTmp); err != nil {
+		return 0, fmt.Errorf("create temp: %w", err)
+	}
+
+	// Update survivors (rn=1) with aggregated values.
+	updSurvivors := fmt.Sprintf(`
+		UPDATE %s t
+		SET retry_count    = w.sum_retry,
+		    created_at     = w.min_created,
+		    quarantined_at = w.min_quar
+		FROM _dlq_dedup_work w
+		WHERE t.id = w.id AND w.rn = 1`, s.table)
+	if _, err := tx.ExecContext(ctx, updSurvivors); err != nil {
+		return 0, fmt.Errorf("update survivors: %w", err)
+	}
+
+	// Delete non-survivors (rn>1) using the frozen ranking.
+	delDups := fmt.Sprintf(`
+		DELETE FROM %s t
+		USING _dlq_dedup_work w
+		WHERE t.id = w.id AND w.rn > 1`, s.table)
+	res, err := tx.ExecContext(ctx, delDups)
+	if err != nil {
+		return 0, fmt.Errorf("delete duplicates: %w", err)
+	}
+	removed, _ := res.RowsAffected()
+
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("commit: %w", err)
+	}
+
+	if err := s.createUniqueIndexConcurrently(ctx); err != nil {
+		return removed, err
+	}
+	return removed, nil
+}
+
+// createUniqueIndexConcurrently creates the dedup unique index without holding a
+// long write lock. CONCURRENTLY cannot run inside a transaction, so this runs as
+// a standalone statement.
+// #nosec G201 -- table name is set at construction, not user input
+func (s *PostgresStore) createUniqueIndexConcurrently(ctx context.Context) error {
+	idx := fmt.Sprintf(
+		"CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS uniq_%s_event_original ON %s(event_name, original_id)",
+		s.table, s.table)
+	if _, err := s.db.ExecContext(ctx, idx); err != nil {
+		return fmt.Errorf("create unique index: %w", err)
+	}
+	return nil
+}
+
 // Compile-time checks
 var _ Store = (*PostgresStore)(nil)
 var _ StatsProvider = (*PostgresStore)(nil)

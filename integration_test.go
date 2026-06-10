@@ -261,8 +261,16 @@ func TestMongoStoreDedup(t *testing.T) {
 	}
 	_ = off.Collection().Drop(ctx)
 	t.Cleanup(func() { _ = off.Collection().Drop(ctx) })
+	// Ensure index bootstrap has run so the assertion is not a race: with dedup
+	// OFF there must be NO unique index, so duplicate (event,original) inserts
+	// are allowed even after EnsureIndexes completes.
+	if err := off.EnsureIndexes(ctx); err != nil {
+		t.Fatalf("ensure indexes: %v", err)
+	}
 	_ = off.Store(ctx, &Message{ID: "a", EventName: "e", OriginalID: "o1", CreatedAt: time.Now()})
-	_ = off.Store(ctx, &Message{ID: "b", EventName: "e", OriginalID: "o1", CreatedAt: time.Now()})
+	if err := off.Store(ctx, &Message{ID: "b", EventName: "e", OriginalID: "o1", CreatedAt: time.Now()}); err != nil {
+		t.Fatalf("dedup off: second insert of same (event,original) must succeed, got: %v", err)
+	}
 	if n, _ := off.Count(ctx, Filter{}); n != 2 {
 		t.Fatalf("dedup off: want 2, got %d", n)
 	}

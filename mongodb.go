@@ -215,10 +215,12 @@ func (s *MongoStore) Indexes() []mongo.IndexModel {
 // field) and conflicts with the non-sparse definition this version creates. Any
 // pre-existing sparse retried_at index is dropped first so it can be recreated.
 //
-// When dedup is enabled, a unique index on (event_name, original_id) is created
-// in a separate, failure-tolerant step. If the collection still contains legacy
-// duplicate pairs the index creation will fail; run MigrateDedup to collapse
-// duplicates first, then call EnsureIndexes again.
+// When dedup is enabled (WithMongoDedup), a unique index on (event_name,
+// original_id) is created in a separate, failure-tolerant step. If the collection
+// still contains legacy duplicate pairs the index creation will fail; run
+// MigrateDedup to collapse duplicates first, then call EnsureIndexes again.
+// When dedup is disabled (the default), no unique index is created, so multiple
+// DLQ entries for the same (event_name, original_id) are permitted.
 func (s *MongoStore) EnsureIndexes(ctx context.Context) error {
 	if err := s.dropLegacySparseRetriedIndex(ctx); err != nil {
 		return err
@@ -227,17 +229,22 @@ func (s *MongoStore) EnsureIndexes(ctx context.Context) error {
 		return err
 	}
 
-	// Unique dedup index on (event_name, original_id). Created best-effort:
-	// on a collection that still contains legacy duplicates this fails, which is
-	// expected — callers run MigrateDedup to collapse duplicates first. A failure
-	// here must NOT break index bootstrap, so we log and continue.
-	uniqModel := mongo.IndexModel{
-		Keys:    bson.D{{Key: "event_name", Value: 1}, {Key: "original_id", Value: 1}},
-		Options: options.Index().SetUnique(true).SetName("uniq_event_original"),
-	}
-	if _, err := s.collection.Indexes().CreateOne(ctx, uniqModel); err != nil {
-		slog.Default().Warn("dlq: unique dedup index not created (legacy duplicates?); run MigrateDedup",
-			"collection", s.collection.Name(), "error", err)
+	// Unique dedup index on (event_name, original_id). Only created when dedup is
+	// enabled: with dedup off, multiple DLQ entries for the same (event_name,
+	// original_id) are allowed and expected, so no unique constraint must exist.
+	// Created best-effort: on a collection that still contains legacy duplicates
+	// this fails, which is expected — callers run MigrateDedup to collapse
+	// duplicates first. A failure here must NOT break index bootstrap, so we log
+	// and continue.
+	if s.dedup {
+		uniqModel := mongo.IndexModel{
+			Keys:    bson.D{{Key: "event_name", Value: 1}, {Key: "original_id", Value: 1}},
+			Options: options.Index().SetUnique(true).SetName("uniq_event_original"),
+		}
+		if _, err := s.collection.Indexes().CreateOne(ctx, uniqModel); err != nil {
+			slog.Default().Warn("dlq: unique dedup index not created (legacy duplicates?); run MigrateDedup",
+				"collection", s.collection.Name(), "error", err)
+		}
 	}
 	return nil
 }

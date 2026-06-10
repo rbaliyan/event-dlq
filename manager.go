@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -52,6 +53,7 @@ import (
 //	// Get statistics
 //	stats, _ := manager.Stats(ctx)
 //	fmt.Printf("Pending: %d\n", stats.PendingMessages)
+//
 // Republisher sends events for DLQ replay.
 // This is an alias for event.Sender.
 type Republisher = event.Sender
@@ -67,12 +69,13 @@ func (r *transportRepublisher) Send(ctx context.Context, eventName string, event
 }
 
 type Manager struct {
-	store       Store
-	republisher Republisher
-	logger      *slog.Logger
-	metrics     *Metrics
-	backoff     BackoffStrategy
-	maxRetries  int
+	store         Store
+	republisher   Republisher
+	logger        *slog.Logger
+	metrics       *Metrics
+	backoff       BackoffStrategy
+	maxRetries    int
+	terminalError func(*Message) bool
 }
 
 // BackoffStrategy is an alias for backoff.Strategy from the main event library.
@@ -114,10 +117,11 @@ var _ Storer = (*Manager)(nil)
 
 // managerOptions holds configuration for Manager (unexported)
 type managerOptions struct {
-	logger     *slog.Logger
-	metrics    *Metrics
-	backoff    BackoffStrategy
-	maxRetries int
+	logger        *slog.Logger
+	metrics       *Metrics
+	backoff       BackoffStrategy
+	maxRetries    int
+	terminalError func(*Message) bool
 }
 
 // ManagerOption is a functional option for configuring Manager
@@ -213,6 +217,36 @@ func WithMaxRetries(max int) ManagerOption {
 	}
 }
 
+// WithTerminalError sets a predicate identifying non-retryable ("terminal")
+// messages. During Replay, a message for which the predicate returns true is
+// quarantined (if the store supports Quarantiner) and never republished,
+// preventing poison-message replay loops.
+//
+// Default is nil: when unset, Replay behaves exactly as before — every message
+// is replayed regardless of error.
+func WithTerminalError(pred func(*Message) bool) ManagerOption {
+	return func(o *managerOptions) {
+		o.terminalError = pred
+	}
+}
+
+// TerminalErrorMatching returns a predicate that reports a message as terminal
+// when its Error contains any of the given (case-sensitive) substrings. An
+// empty Error never matches.
+func TerminalErrorMatching(patterns ...string) func(*Message) bool {
+	return func(msg *Message) bool {
+		if msg == nil || msg.Error == "" {
+			return false
+		}
+		for _, p := range patterns {
+			if p != "" && strings.Contains(msg.Error, p) {
+				return true
+			}
+		}
+		return false
+	}
+}
+
 // NewManager creates a new DLQ manager.
 //
 // The manager requires a store for persistence and a republisher for replaying
@@ -259,12 +293,13 @@ func NewManager(store Store, r Republisher, opts ...ManagerOption) (*Manager, er
 	}
 
 	return &Manager{
-		store:       store,
-		republisher: r,
-		logger:      o.logger,
-		metrics:     o.metrics,
-		backoff:     o.backoff,
-		maxRetries:  o.maxRetries,
+		store:         store,
+		republisher:   r,
+		logger:        o.logger,
+		metrics:       o.metrics,
+		backoff:       o.backoff,
+		maxRetries:    o.maxRetries,
+		terminalError: o.terminalError,
 	}, nil
 }
 

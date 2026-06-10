@@ -148,6 +148,10 @@ func (s *MemoryStore) matchesFilter(msg *Message, filter Filter) bool {
 		return false
 	}
 
+	if filter.ExcludeQuarantined && msg.QuarantinedAt != nil {
+		return false
+	}
+
 	return true
 }
 
@@ -163,6 +167,20 @@ func (s *MemoryStore) MarkRetried(ctx context.Context, id string) error {
 
 	now := time.Now()
 	msg.RetriedAt = &now
+	return nil
+}
+
+// Quarantine marks a message as a terminal, non-retryable failure.
+func (s *MemoryStore) Quarantine(ctx context.Context, id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	msg, ok := s.messages[id]
+	if !ok {
+		return fmt.Errorf("%s: %w", id, ErrNotFound)
+	}
+	now := time.Now()
+	msg.QuarantinedAt = &now
 	return nil
 }
 
@@ -300,4 +318,5 @@ func (s *MemoryStore) Health(ctx context.Context) *health.Result {
 // Compile-time checks
 var _ Store = (*MemoryStore)(nil)
 var _ StatsProvider = (*MemoryStore)(nil)
+var _ Quarantiner = (*MemoryStore)(nil)
 var _ health.Checker = (*MemoryStore)(nil)

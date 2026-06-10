@@ -14,16 +14,41 @@ import (
 type MemoryStore struct {
 	mu       sync.RWMutex
 	messages map[string]*Message
+	byKey    map[string]string // dedupKey(eventName, originalID) -> message ID
+	dedup    bool
 }
 
-// NewMemoryStore creates a new in-memory DLQ store
-func NewMemoryStore() *MemoryStore {
-	return &MemoryStore{
+// MemoryStoreOption configures a MemoryStore.
+type MemoryStoreOption func(*MemoryStore)
+
+// WithMemoryDedup enables upsert-on-(EventName, OriginalID): re-storing a message
+// with the same event name and (non-empty) original ID increments retry_count on
+// the existing row instead of inserting a new one. Default: off.
+func WithMemoryDedup() MemoryStoreOption {
+	return func(s *MemoryStore) { s.dedup = true }
+}
+
+// dedupKey returns the composite dedup index key for a (eventName, originalID) pair.
+func dedupKey(eventName, originalID string) string {
+	return eventName + "\x00" + originalID
+}
+
+// NewMemoryStore creates a new in-memory DLQ store.
+func NewMemoryStore(opts ...MemoryStoreOption) *MemoryStore {
+	s := &MemoryStore{
 		messages: make(map[string]*Message),
+		byKey:    make(map[string]string),
 	}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
 }
 
-// Store adds a message to the DLQ
+// Store adds a message to the DLQ. When dedup is enabled and msg.OriginalID is
+// non-empty, a duplicate (EventName, OriginalID) pair upserts the existing row:
+// RetryCount is incremented, Error/Payload/Metadata are updated to the latest
+// values, RetriedAt is cleared, and CreatedAt is preserved as first-seen.
 func (s *MemoryStore) Store(ctx context.Context, msg *Message) error {
 	if msg == nil {
 		return fmt.Errorf("message is nil")
@@ -34,6 +59,29 @@ func (s *MemoryStore) Store(ctx context.Context, msg *Message) error {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	if s.dedup && msg.OriginalID != "" {
+		key := dedupKey(msg.EventName, msg.OriginalID)
+		if existingID, ok := s.byKey[key]; ok {
+			if existing, ok2 := s.messages[existingID]; ok2 {
+				existing.RetryCount++
+				existing.Error = msg.Error
+				existing.Payload = msg.Payload
+				existing.RetriedAt = nil
+				if msg.Metadata != nil {
+					existing.Metadata = make(map[string]string, len(msg.Metadata))
+					for k, v := range msg.Metadata {
+						existing.Metadata[k] = v
+					}
+				} else {
+					existing.Metadata = nil
+				}
+				// CreatedAt and QuarantinedAt are intentionally preserved (first-seen).
+				return nil
+			}
+		}
+		s.byKey[key] = msg.ID
+	}
 
 	// Make a copy
 	stored := *msg
@@ -189,10 +237,14 @@ func (s *MemoryStore) Delete(ctx context.Context, id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if _, ok := s.messages[id]; !ok {
+	msg, ok := s.messages[id]
+	if !ok {
 		return fmt.Errorf("%s: %w", id, ErrNotFound)
 	}
 
+	if s.dedup && msg.OriginalID != "" {
+		delete(s.byKey, dedupKey(msg.EventName, msg.OriginalID))
+	}
 	delete(s.messages, id)
 	return nil
 }
@@ -207,6 +259,9 @@ func (s *MemoryStore) DeleteOlderThan(ctx context.Context, age time.Duration) (i
 
 	for id, msg := range s.messages {
 		if msg.CreatedAt.Before(cutoff) {
+			if s.dedup && msg.OriginalID != "" {
+				delete(s.byKey, dedupKey(msg.EventName, msg.OriginalID))
+			}
 			delete(s.messages, id)
 			deleted++
 		}
@@ -224,6 +279,9 @@ func (s *MemoryStore) DeleteByFilter(ctx context.Context, filter Filter) (int64,
 
 	for id, msg := range s.messages {
 		if s.matchesFilter(msg, filter) {
+			if s.dedup && msg.OriginalID != "" {
+				delete(s.byKey, dedupKey(msg.EventName, msg.OriginalID))
+			}
 			delete(s.messages, id)
 			deleted++
 		}

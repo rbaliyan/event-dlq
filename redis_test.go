@@ -502,6 +502,60 @@ func TestRedisStore_Quarantine(t *testing.T) {
 	}
 }
 
+func newRedisStoreDedup(t *testing.T) *RedisStore {
+	t.Helper()
+	mr := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	store, err := NewRedisStore(client, WithRedisDedup())
+	if err != nil {
+		t.Fatalf("new dedup store: %v", err)
+	}
+	return store
+}
+
+func TestRedisStore_Dedup(t *testing.T) {
+	ctx := context.Background()
+
+	// dedup OFF (default) => two distinct messages
+	off, _ := setupRedisStore(t)
+	_ = off.Store(ctx, &Message{ID: "a", EventName: "e", OriginalID: "o1", CreatedAt: time.Now()})
+	_ = off.Store(ctx, &Message{ID: "b", EventName: "e", OriginalID: "o1", CreatedAt: time.Now()})
+	if n, _ := off.Count(ctx, Filter{}); n != 2 {
+		t.Fatalf("dedup off: want 2, got %d", n)
+	}
+
+	// dedup ON => upsert on (event_name, original_id)
+	on := newRedisStoreDedup(t)
+	first := time.Now().Add(-time.Hour).Truncate(time.Second)
+	_ = on.Store(ctx, &Message{ID: "a", EventName: "e", OriginalID: "o1", Error: "err1", RetryCount: 3, CreatedAt: first})
+	_ = on.Store(ctx, &Message{ID: "b", EventName: "e", OriginalID: "o1", Error: "err2", RetryCount: 0, CreatedAt: time.Now()})
+	if n, _ := on.Count(ctx, Filter{}); n != 1 {
+		t.Fatalf("dedup on: want 1, got %d", n)
+	}
+	g, err := on.GetByOriginalID(ctx, "o1")
+	if err != nil {
+		t.Fatalf("getByOriginalID: %v", err)
+	}
+	if g.RetryCount != 4 {
+		t.Fatalf("retry_count: want 4, got %d", g.RetryCount)
+	}
+	if g.Error != "err2" {
+		t.Fatalf("error latest: want err2, got %q", g.Error)
+	}
+	// created_at is stored as unix seconds; compare at second granularity
+	if g.CreatedAt.Unix() != first.Unix() {
+		t.Fatalf("created_at preserved: want %v (%d), got %v (%d)", first, first.Unix(), g.CreatedAt, g.CreatedAt.Unix())
+	}
+
+	// empty OriginalID under dedup => distinct inserts (no composite key to deduplicate on)
+	on2 := newRedisStoreDedup(t)
+	_ = on2.Store(ctx, &Message{ID: "a", EventName: "e", OriginalID: "", CreatedAt: time.Now()})
+	_ = on2.Store(ctx, &Message{ID: "b", EventName: "e", OriginalID: "", CreatedAt: time.Now()})
+	if n, _ := on2.Count(ctx, Filter{}); n != 2 {
+		t.Fatalf("empty original under dedup: want 2, got %d", n)
+	}
+}
+
 func TestNewRedisStore_Options(t *testing.T) {
 	mr := miniredis.RunT(t)
 	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})

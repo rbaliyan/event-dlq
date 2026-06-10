@@ -57,6 +57,7 @@ Key layout:
   dlq:by_event:{name}     sorted set  score=created_at_unix  member=msgID
   dlq:msg:{id}            hash        message fields
   dlq:retried             set         retried msgIDs
+  dlq:quarantined         set         quarantined msgIDs
   dlq:by_original:{id}    string      → msgID
 */
 
@@ -68,7 +69,8 @@ Key layout:
 // combined event+time queries at the same complexity.
 //
 // Filters that cannot be pushed to Redis (Source, Error contains, MaxRetries,
-// ExcludeRetried) are applied in-memory after the initial sorted-set lookup.
+// ExcludeRetried, ExcludeQuarantined) are applied in-memory after the initial
+// sorted-set lookup.
 type RedisStore struct {
 	client         redis.Cmdable
 	logger         *slog.Logger
@@ -76,6 +78,7 @@ type RedisStore struct {
 	msgPrefix      string // dlq:msg:
 	eventPrefix    string // dlq:by_event:
 	retriedKey     string // dlq:retried
+	quarantinedKey string // dlq:quarantined
 	originalPrefix string // dlq:by_original:
 }
 
@@ -130,6 +133,7 @@ func NewRedisStore(client redis.Cmdable, opts ...RedisStoreOption) (*RedisStore,
 		msgPrefix:      o.keyPrefix + "msg:",
 		eventPrefix:    o.keyPrefix + "by_event:",
 		retriedKey:     o.keyPrefix + "retried",
+		quarantinedKey: o.keyPrefix + "quarantined",
 		originalPrefix: o.keyPrefix + "by_original:",
 	}, nil
 }
@@ -244,6 +248,15 @@ func (s *RedisStore) parseMessage(fields map[string]string) (*Message, error) {
 		msg.RetriedAt = &t
 	}
 
+	if ts := fields["quarantined_at"]; ts != "" {
+		unix, err := strconv.ParseInt(ts, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("parse quarantined_at: %w", err)
+		}
+		t := time.Unix(unix, 0)
+		msg.QuarantinedAt = &t
+	}
+
 	return msg, nil
 }
 
@@ -304,6 +317,9 @@ func (s *RedisStore) List(ctx context.Context, filter Filter) ([]*Message, error
 		if filter.ExcludeRetried && msg.RetriedAt != nil {
 			continue
 		}
+		if filter.ExcludeQuarantined && msg.QuarantinedAt != nil {
+			continue
+		}
 		if filter.MaxRetries > 0 && msg.RetryCount > filter.MaxRetries {
 			continue
 		}
@@ -336,6 +352,7 @@ func (s *RedisStore) List(ctx context.Context, filter Filter) ([]*Message, error
 // ExcludeRetried filters are present.
 func (s *RedisStore) Count(ctx context.Context, filter Filter) (int64, error) {
 	hasComplexFilters := filter.ExcludeRetried ||
+		filter.ExcludeQuarantined ||
 		filter.MaxRetries > 0 ||
 		filter.Source != "" ||
 		filter.Error != ""
@@ -399,6 +416,46 @@ func (s *RedisStore) MarkRetried(ctx context.Context, id string) error {
 	return nil
 }
 
+// quarantineScript atomically marks a DLQ message as quarantined.
+//
+// KEYS[1] = message hash key (dlq:msg:{id})
+// KEYS[2] = quarantined set key (dlq:quarantined)
+//
+// ARGV[1] = message ID
+// ARGV[2] = quarantined_at unix timestamp
+//
+// Returns 1 on success, 0 if message not found.
+var quarantineScript = redis.NewScript(`
+local msgKey = KEYS[1]
+local quarantinedSetKey = KEYS[2]
+local msgID = ARGV[1]
+local quarantinedAt = ARGV[2]
+
+if redis.call('EXISTS', msgKey) == 0 then
+    return 0
+end
+
+redis.call('HSET', msgKey, 'quarantined_at', quarantinedAt)
+redis.call('SADD', quarantinedSetKey, msgID)
+
+return 1
+`)
+
+// Quarantine marks a message as a terminal, non-retryable failure.
+func (s *RedisStore) Quarantine(ctx context.Context, id string) error {
+	result, err := quarantineScript.Run(ctx, s.client,
+		[]string{s.msgPrefix + id, s.quarantinedKey},
+		id, time.Now().Unix(),
+	).Int64()
+	if err != nil {
+		return fmt.Errorf("quarantine script: %w", err)
+	}
+	if result == 0 {
+		return fmt.Errorf("%s: %w", id, ErrNotFound)
+	}
+	return nil
+}
+
 // Delete removes a message from the DLQ and all its index entries.
 func (s *RedisStore) Delete(ctx context.Context, id string) error {
 	msgKey := s.msgPrefix + id
@@ -427,6 +484,10 @@ func (s *RedisStore) Delete(ctx context.Context, id string) error {
 
 	if err := s.client.SRem(ctx, s.retriedKey, id).Err(); err != nil {
 		s.logger.Warn("failed to remove from retried set during delete", "id", id, "error", err)
+	}
+
+	if err := s.client.SRem(ctx, s.quarantinedKey, id).Err(); err != nil {
+		s.logger.Warn("failed to remove from quarantined set during delete", "id", id, "error", err)
 	}
 
 	if originalID := fields["original_id"]; originalID != "" {
@@ -567,4 +628,5 @@ func (s *RedisStore) Health(ctx context.Context) *health.Result {
 // Compile-time checks
 var _ Store = (*RedisStore)(nil)
 var _ StatsProvider = (*RedisStore)(nil)
+var _ Quarantiner = (*RedisStore)(nil)
 var _ health.Checker = (*RedisStore)(nil)

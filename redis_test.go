@@ -224,8 +224,8 @@ func TestRedisStore_List_TimeFilter(t *testing.T) {
 
 	t.Run("start and end time", func(t *testing.T) {
 		results, err := store.List(ctx, Filter{
-			After: base.Add(-90 * time.Minute),
-			Before:   base.Add(-30 * time.Minute),
+			After:  base.Add(-90 * time.Minute),
+			Before: base.Add(-30 * time.Minute),
 		})
 		require.NoError(t, err)
 		assert.Len(t, results, 1)
@@ -235,7 +235,7 @@ func TestRedisStore_List_TimeFilter(t *testing.T) {
 	t.Run("event name with time filter", func(t *testing.T) {
 		results, err := store.List(ctx, Filter{
 			EventName: "order.created",
-			After: base.Add(-90 * time.Minute),
+			After:     base.Add(-90 * time.Minute),
 		})
 		require.NoError(t, err)
 		assert.Len(t, results, 2)
@@ -472,6 +472,34 @@ func TestRedisStore_Stats(t *testing.T) {
 	assert.Equal(t, int64(2), stats.PendingMessages)
 	assert.Equal(t, int64(2), stats.MessagesByEvent["order.created"])
 	assert.Equal(t, int64(1), stats.MessagesByEvent["order.updated"])
+}
+
+func TestRedisStore_Quarantine(t *testing.T) {
+	store, _ := setupRedisStore(t)
+	ctx := context.Background()
+	now := time.Now()
+	if err := store.Store(ctx, &Message{ID: "m1", EventName: "e", OriginalID: "o1", CreatedAt: now}); err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	if err := store.Quarantine(ctx, "m1"); err != nil {
+		t.Fatalf("quarantine: %v", err)
+	}
+	got, err := store.Get(ctx, "m1")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.QuarantinedAt == nil {
+		t.Fatal("expected QuarantinedAt set")
+	}
+	list, _ := store.List(ctx, Filter{ExcludeQuarantined: true})
+	for _, m := range list {
+		if m.ID == "m1" {
+			t.Fatal("ExcludeQuarantined must hide quarantined message")
+		}
+	}
+	if err := store.Quarantine(ctx, "missing"); err == nil {
+		t.Fatal("expected error quarantining missing id")
+	}
 }
 
 func TestNewRedisStore_Options(t *testing.T) {

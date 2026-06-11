@@ -196,23 +196,26 @@ for event, count := range stats.MessagesByEvent {
 import "database/sql"
 
 db, _ := sql.Open("postgres", connectionString)
-store := dlq.NewPostgresStore(db).
-    WithTable("custom_dlq_table") // Optional: custom table name
+store, err := dlq.NewPostgresStore(db, dlq.WithTable("custom_dlq_table")) // Optional: custom table name
+if err != nil {
+    // handle error
+}
 ```
 
-Required schema:
+Required schema (illustrative — `EnsureTable(ctx)` manages this automatically, including the dedup unique index when dedup is enabled):
 ```sql
 CREATE TABLE event_dlq (
-    id          VARCHAR(36) PRIMARY KEY,
-    event_name  VARCHAR(255) NOT NULL,
-    original_id VARCHAR(36) NOT NULL,
-    payload     BYTEA NOT NULL,
-    metadata    JSONB,
-    error       TEXT NOT NULL,
-    retry_count INT NOT NULL DEFAULT 0,
-    source      VARCHAR(255),
-    created_at  TIMESTAMP NOT NULL DEFAULT NOW(),
-    retried_at  TIMESTAMP
+    id             VARCHAR(36) PRIMARY KEY,
+    event_name     VARCHAR(255) NOT NULL,
+    original_id    TEXT NOT NULL,
+    payload        BYTEA NOT NULL,
+    metadata       JSONB,
+    error          TEXT NOT NULL,
+    retry_count    INT NOT NULL DEFAULT 0,
+    source         VARCHAR(255),
+    created_at     TIMESTAMP NOT NULL DEFAULT NOW(),
+    retried_at     TIMESTAMP,
+    quarantined_at TIMESTAMP
 );
 
 CREATE INDEX idx_dlq_event_name ON event_dlq(event_name);
@@ -226,11 +229,13 @@ CREATE INDEX idx_dlq_retried_at ON event_dlq(retried_at) WHERE retried_at IS NUL
 import "go.mongodb.org/mongo-driver/v2/mongo"
 
 db := mongoClient.Database("myapp")
-store := dlq.NewMongoStore(db).
-    WithCollection("custom_dlq") // Optional: custom collection name
+store, err := dlq.NewMongoStore(db, dlq.WithCollection("custom_dlq")) // Optional: custom collection name
+if err != nil {
+    // handle error
+}
 
 // Create indexes
-err := store.EnsureIndexes(ctx)
+err = store.EnsureIndexes(ctx)
 
 // Optional: Create as capped collection for automatic cleanup
 err := store.CreateCapped(ctx, 100*1024*1024, 50000) // 100MB, max 50k docs
@@ -242,9 +247,10 @@ err := store.CreateCapped(ctx, 100*1024*1024, 50000) // 100MB, max 50k docs
 import "github.com/redis/go-redis/v9"
 
 client := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
-store := dlq.NewRedisStore(client).
-    WithKeyPrefix("myapp:dlq:").  // Optional: custom key prefix
-    WithMaxLen(100000)            // Optional: max stream length
+store, err := dlq.NewRedisStore(client, dlq.WithKeyPrefix("myapp:dlq:")) // Optional: custom key prefix
+if err != nil {
+    // handle error
+}
 ```
 
 ## Filter Options
@@ -313,6 +319,7 @@ dlq.WithTerminalError(func(msg *dlq.Message) bool {
 - `Replay` always sets `Filter.ExcludeQuarantined = true` internally, so quarantined messages are never re-evaluated on subsequent sweeps.
 - `Stats.QuarantinedMessages` counts quarantined messages; `Stats.PendingMessages` excludes them.
 - The OTel counter `dlq_messages_quarantined_total{event}` increments on each quarantine.
+- `Quarantine(ctx, id)` (and replaying a terminal message by ID via `ReplaySingle`) returns `ErrNotFound` if no message with that ID exists.
 
 ### Stopping an active poison-replay loop (operational runbook)
 

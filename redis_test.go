@@ -3,6 +3,7 @@ package dlq
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -571,4 +572,69 @@ func TestNewRedisStore_Options(t *testing.T) {
 		assert.Equal(t, "custom:by_time", store.timeKey)
 		assert.Equal(t, "custom:msg:", store.msgPrefix)
 	})
+}
+
+func TestRedisStore_MigrateDedup(t *testing.T) {
+	ctx := context.Background()
+	mr := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	seeder, _ := NewRedisStore(client) // dedup OFF: inserts distinct rows
+	store, _ := NewRedisStore(client, WithRedisDedup())
+
+	old := time.Now().Add(-2 * time.Hour)
+	mid := time.Now().Add(-time.Hour)
+	newest := time.Now()
+	_ = seeder.Store(ctx, &Message{ID: "d1", EventName: "e", OriginalID: "o1", Error: "e1", RetryCount: 1, CreatedAt: mid})
+	_ = seeder.Store(ctx, &Message{ID: "d2", EventName: "e", OriginalID: "o1", Error: "e2", RetryCount: 2, CreatedAt: old})
+	_ = seeder.Store(ctx, &Message{ID: "d3", EventName: "e", OriginalID: "o1", Error: "e3", RetryCount: 3, CreatedAt: newest})
+	_ = seeder.Store(ctx, &Message{ID: "u1", EventName: "e", OriginalID: "o2", Error: "x", RetryCount: 5, CreatedAt: newest})
+
+	removed, err := store.MigrateDedup(ctx)
+	if err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	if removed != 2 {
+		t.Fatalf("want 2 removed, got %d", removed)
+	}
+	g, err := store.GetByOriginalID(ctx, "o1")
+	if err != nil {
+		t.Fatalf("survivor: %v", err)
+	}
+	if g.ID != "d3" {
+		t.Fatalf("want newest d3, got %s", g.ID)
+	}
+	if g.RetryCount != 6 {
+		t.Fatalf("want summed 6, got %d", g.RetryCount)
+	}
+	if g.CreatedAt.Unix() != old.Unix() {
+		t.Fatalf("want oldest created_at %d, got %d", old.Unix(), g.CreatedAt.Unix())
+	}
+	if n, _ := store.Count(ctx, Filter{}); n != 2 {
+		t.Fatalf("want 2 total, got %d", n)
+	}
+	// After migrate, a dedup store Store of same (e, o1) must collapse (composite index set).
+	_ = store.Store(ctx, &Message{ID: "x", EventName: "e", OriginalID: "o1", CreatedAt: time.Now()})
+	if n, _ := store.Count(ctx, Filter{}); n != 2 {
+		t.Fatalf("post-migrate dedup write must collapse: want 2, got %d", n)
+	}
+}
+
+func TestRedisStore_MigrateDedup_ForceGuard(t *testing.T) {
+	ctx := context.Background()
+	mr := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	seeder, _ := NewRedisStore(client)
+	store, _ := NewRedisStore(client, WithRedisDedup())
+	for i := 0; i < 4; i++ {
+		_ = seeder.Store(ctx, &Message{ID: fmt.Sprintf("d%d", i), EventName: "e", OriginalID: "o1", RetryCount: 1, CreatedAt: time.Now()})
+	}
+	if _, err := store.MigrateDedup(ctx); err == nil {
+		t.Fatal("expected guard error at >50%")
+	}
+	if _, err := store.MigrateDedup(ctx, WithForce()); err != nil {
+		t.Fatalf("force: %v", err)
+	}
+	if n, _ := store.Count(ctx, Filter{}); n != 1 {
+		t.Fatalf("after force want 1, got %d", n)
+	}
 }

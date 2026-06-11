@@ -752,6 +752,156 @@ func (s *RedisStore) Health(ctx context.Context) *health.Result {
 	}
 }
 
+// MigrateDedup collapses historical duplicate (event_name, original_id) groups
+// into a single entry each: keeps the newest by CreatedAt (tiebreak by ID),
+// sums RetryCount across the group, sets CreatedAt to the oldest in the group,
+// and sets QuarantinedAt to the earliest non-nil QuarantinedAt (if any).
+// The composite dedup index (eventOrigPrefix) and original-ID index are updated
+// to point to the survivor so that subsequent dedup-on writes collapse correctly.
+//
+// MigrateDedup refuses to delete more than 50% of all messages unless WithForce
+// is passed. Returns the number of non-survivor entries removed. Idempotent.
+func (s *RedisStore) MigrateDedup(ctx context.Context, opts ...MigrateDedupOption) (int64, error) {
+	o := applyMigrateDedupOptions(opts)
+
+	// 1. Enumerate all message IDs from the primary time index.
+	allIDs, err := s.client.ZRange(ctx, s.timeKey, 0, -1).Result()
+	if err != nil {
+		return 0, fmt.Errorf("zrange: %w", err)
+	}
+	total := int64(len(allIDs))
+
+	// 2. Fetch all messages.
+	msgs := make([]*Message, 0, len(allIDs))
+	for _, id := range allIDs {
+		fields, ferr := s.client.HGetAll(ctx, s.msgPrefix+id).Result()
+		if ferr != nil || len(fields) == 0 {
+			continue
+		}
+		m, perr := s.parseMessage(fields)
+		if perr != nil {
+			continue
+		}
+		msgs = append(msgs, m)
+	}
+
+	// 3. Group by (EventName, OriginalID) for messages with a non-empty OriginalID.
+	type groupKey struct{ event, orig string }
+	groups := make(map[groupKey][]*Message)
+	for _, m := range msgs {
+		if m.OriginalID == "" {
+			continue
+		}
+		k := groupKey{m.EventName, m.OriginalID}
+		groups[k] = append(groups[k], m)
+	}
+
+	// 4. Compute toDelete across multi-member groups only.
+	var toDelete int64
+	for _, g := range groups {
+		if len(g) > 1 {
+			toDelete += int64(len(g) - 1)
+		}
+	}
+
+	// 5. Safety guard.
+	if !o.force && total > 0 && toDelete*2 > total {
+		return 0, fmt.Errorf(
+			"dlq: MigrateDedup would delete %d of %d messages (>50%%); pass WithForce to proceed",
+			toDelete, total,
+		)
+	}
+
+	// 6. Collapse each multi-member group.
+	var removed int64
+	for k, group := range groups {
+		if len(group) <= 1 {
+			continue
+		}
+
+		// Identify the survivor: newest CreatedAt, tiebreak by ID (lexicographic).
+		survivor := group[0]
+		for _, m := range group[1:] {
+			if m.CreatedAt.After(survivor.CreatedAt) ||
+				(m.CreatedAt.Equal(survivor.CreatedAt) && m.ID > survivor.ID) {
+				survivor = m
+			}
+		}
+
+		// Compute aggregates across all group members.
+		var sumRetry int
+		minCreated := survivor.CreatedAt
+		var minQuarantined *time.Time
+		for _, m := range group {
+			sumRetry += m.RetryCount
+			if m.CreatedAt.Before(minCreated) {
+				minCreated = m.CreatedAt
+			}
+			if m.QuarantinedAt != nil {
+				if minQuarantined == nil || m.QuarantinedAt.Before(*minQuarantined) {
+					qt := *m.QuarantinedAt
+					minQuarantined = &qt
+				}
+			}
+		}
+
+		// Delete each non-survivor (reuse Delete which cleans all indexes).
+		for _, m := range group {
+			if m.ID == survivor.ID {
+				continue
+			}
+			// Delete removes originalPrefix+m.OriginalID too, but since all
+			// duplicates share the same OriginalID and we re-point it below,
+			// that is harmless.
+			if derr := s.Delete(ctx, m.ID); derr == nil {
+				removed++
+			}
+		}
+
+		// Update survivor hash with aggregated values.
+		survivorKey := s.msgPrefix + survivor.ID
+		hsetArgs := []interface{}{
+			"retry_count", sumRetry,
+			"created_at", minCreated.Unix(),
+		}
+		if minQuarantined != nil {
+			hsetArgs = append(hsetArgs, "quarantined_at", minQuarantined.Unix())
+			if aerr := s.client.SAdd(ctx, s.quarantinedKey, survivor.ID).Err(); aerr != nil {
+				s.logger.Warn("failed to add survivor to quarantined set", "id", survivor.ID, "error", aerr)
+			}
+		}
+		if herr := s.client.HSet(ctx, survivorKey, hsetArgs...).Err(); herr != nil {
+			return removed, fmt.Errorf("hset survivor %s: %w", survivor.ID, herr)
+		}
+
+		// Update primary time-index score to minCreated so ordering reflects first-seen.
+		if zerr := s.client.ZAdd(ctx, s.timeKey, redis.Z{
+			Score:  float64(minCreated.Unix()),
+			Member: survivor.ID,
+		}).Err(); zerr != nil {
+			s.logger.Warn("failed to update time index score for survivor", "id", survivor.ID, "error", zerr)
+		}
+		// Update per-event index score as well.
+		if zerr := s.client.ZAdd(ctx, s.eventPrefix+k.event, redis.Z{
+			Score:  float64(minCreated.Unix()),
+			Member: survivor.ID,
+		}).Err(); zerr != nil {
+			s.logger.Warn("failed to update event index score for survivor", "id", survivor.ID, "error", zerr)
+		}
+
+		// Point both composite and original indexes at the survivor.
+		compositeKey := s.eventOrigPrefix + k.event + ":" + k.orig
+		if serr := s.client.Set(ctx, compositeKey, survivor.ID, 0).Err(); serr != nil {
+			return removed, fmt.Errorf("set composite key %s: %w", compositeKey, serr)
+		}
+		if serr := s.client.Set(ctx, s.originalPrefix+k.orig, survivor.ID, 0).Err(); serr != nil {
+			return removed, fmt.Errorf("set original key %s: %w", k.orig, serr)
+		}
+	}
+
+	return removed, nil
+}
+
 // Compile-time checks
 var _ Store = (*RedisStore)(nil)
 var _ StatsProvider = (*RedisStore)(nil)

@@ -49,15 +49,89 @@ redis.call('ZADD', eventKey, score, msgID)
 return 1
 `)
 
+// storeDedupScript atomically upserts a DLQ message when dedup is enabled.
+//
+// KEYS[1] = composite dedup key (dlq:by_eventorig:{event}:{original})
+//
+// ARGV positional layout:
+//
+//	1  msgPrefix      (e.g. "dlq:msg:")
+//	2  timeKey        (e.g. "dlq:by_time")
+//	3  eventKey       (e.g. "dlq:by_event:{event_name}")
+//	4  retriedKey     (e.g. "dlq:retried")
+//	5  originalKey    (e.g. "dlq:by_original:{original_id}")
+//	6  score          (created_at unix seconds, numeric)
+//	7  msgID
+//	8  event_name
+//	9  original_id
+//	10 error
+//	11 payload
+//	12 metadata
+//	13 source
+//	14 retry_count    (initial, as string; only used on fresh insert)
+//
+// NOTE: This script is NOT Redis-Cluster-safe. It builds hash keys dynamically
+// from ARGV-supplied prefixes (msgPrefix + existingID / msgID), which means
+// those keys may hash to different slots than KEYS[1]. The existing RedisStore
+// already has the same limitation for its side-index SET writes, so this is an
+// accepted constraint: the store is designed for single-node / Sentinel Redis.
+var storeDedupScript = redis.NewScript(`
+local compositeKey = KEYS[1]
+local msgPrefix    = ARGV[1]
+local timeKey      = ARGV[2]
+local eventKey     = ARGV[3]
+local retriedKey   = ARGV[4]
+local originalKey  = ARGV[5]
+local score        = tonumber(ARGV[6])
+local msgID        = ARGV[7]
+local event_name   = ARGV[8]
+local original_id  = ARGV[9]
+local err          = ARGV[10]
+local payload      = ARGV[11]
+local metadata     = ARGV[12]
+local source       = ARGV[13]
+local retry_count  = ARGV[14]
+
+local existing = redis.call('GET', compositeKey)
+if existing then
+  -- Upsert path: update existing message in-place.
+  local hk = msgPrefix .. existing
+  redis.call('HINCRBY', hk, 'retry_count', 1)
+  redis.call('HSET', hk, 'error', err, 'payload', payload, 'metadata', metadata, 'retried_at', '')
+  redis.call('SREM', retriedKey, existing)
+  return existing
+else
+  -- Insert path: brand-new message.
+  local hk = msgPrefix .. msgID
+  redis.call('HSET', hk,
+    'id',          msgID,
+    'event_name',  event_name,
+    'original_id', original_id,
+    'payload',     payload,
+    'metadata',    metadata,
+    'error',       err,
+    'retry_count', retry_count,
+    'source',      source,
+    'created_at',  score)
+  redis.call('ZADD', timeKey,  score, msgID)
+  redis.call('ZADD', eventKey, score, msgID)
+  redis.call('SET', compositeKey, msgID)
+  redis.call('SET', originalKey,  msgID)
+  return msgID
+end
+`)
+
 /*
 Redis Schema:
 
 Key layout:
-  dlq:by_time             sorted set  score=created_at_unix  member=msgID
-  dlq:by_event:{name}     sorted set  score=created_at_unix  member=msgID
-  dlq:msg:{id}            hash        message fields
-  dlq:retried             set         retried msgIDs
-  dlq:by_original:{id}    string      → msgID
+  dlq:by_time                      sorted set  score=created_at_unix  member=msgID
+  dlq:by_event:{name}              sorted set  score=created_at_unix  member=msgID
+  dlq:msg:{id}                     hash        message fields
+  dlq:retried                      set         retried msgIDs
+  dlq:quarantined                  set         quarantined msgIDs
+  dlq:by_original:{id}             string      → msgID
+  dlq:by_eventorig:{event}:{orig}  string      → msgID  (dedup composite index)
 */
 
 // RedisStore is a Redis-based DLQ store.
@@ -68,15 +142,19 @@ Key layout:
 // combined event+time queries at the same complexity.
 //
 // Filters that cannot be pushed to Redis (Source, Error contains, MaxRetries,
-// ExcludeRetried) are applied in-memory after the initial sorted-set lookup.
+// ExcludeRetried, ExcludeQuarantined) are applied in-memory after the initial
+// sorted-set lookup.
 type RedisStore struct {
-	client         redis.Cmdable
-	logger         *slog.Logger
-	timeKey        string // dlq:by_time — primary sorted set
-	msgPrefix      string // dlq:msg:
-	eventPrefix    string // dlq:by_event:
-	retriedKey     string // dlq:retried
-	originalPrefix string // dlq:by_original:
+	client          redis.Cmdable
+	logger          *slog.Logger
+	timeKey         string // dlq:by_time — primary sorted set
+	msgPrefix       string // dlq:msg:
+	eventPrefix     string // dlq:by_event:
+	retriedKey      string // dlq:retried
+	quarantinedKey  string // dlq:quarantined
+	originalPrefix  string // dlq:by_original:
+	eventOrigPrefix string // dlq:by_eventorig: — composite (event,original) dedup index
+	dedup           bool   // when true, Store upserts on (event_name, original_id)
 }
 
 // RedisStoreOption configures a RedisStore.
@@ -85,6 +163,7 @@ type RedisStoreOption func(*redisStoreOptions)
 type redisStoreOptions struct {
 	keyPrefix string
 	logger    *slog.Logger
+	dedup     bool
 }
 
 // WithKeyPrefix sets a custom key prefix for all Redis keys.
@@ -102,6 +181,22 @@ func WithRedisLogger(logger *slog.Logger) RedisStoreOption {
 		if logger != nil {
 			o.logger = logger
 		}
+	}
+}
+
+// WithRedisDedup enables opt-in deduplication for the Redis store.
+//
+// When enabled, storing a message whose OriginalID is non-empty and whose
+// (EventName, OriginalID) pair already exists in the store will upsert
+// rather than insert: the retry count is incremented, the error/payload/
+// metadata fields are updated to the latest values, any retried state is
+// cleared, and the original created_at timestamp is preserved. Messages
+// with an empty OriginalID are always inserted as distinct entries.
+//
+// Dedup is OFF by default.
+func WithRedisDedup() RedisStoreOption {
+	return func(o *redisStoreOptions) {
+		o.dedup = true
 	}
 }
 
@@ -124,20 +219,30 @@ func NewRedisStore(client redis.Cmdable, opts ...RedisStoreOption) (*RedisStore,
 	}
 
 	return &RedisStore{
-		client:         client,
-		logger:         logger,
-		timeKey:        o.keyPrefix + "by_time",
-		msgPrefix:      o.keyPrefix + "msg:",
-		eventPrefix:    o.keyPrefix + "by_event:",
-		retriedKey:     o.keyPrefix + "retried",
-		originalPrefix: o.keyPrefix + "by_original:",
+		client:          client,
+		logger:          logger,
+		timeKey:         o.keyPrefix + "by_time",
+		msgPrefix:       o.keyPrefix + "msg:",
+		eventPrefix:     o.keyPrefix + "by_event:",
+		retriedKey:      o.keyPrefix + "retried",
+		quarantinedKey:  o.keyPrefix + "quarantined",
+		originalPrefix:  o.keyPrefix + "by_original:",
+		eventOrigPrefix: o.keyPrefix + "by_eventorig:",
+		dedup:           o.dedup,
 	}, nil
 }
 
 // Store adds a message to the DLQ.
-// The core operations (hash write, time index, event index) are executed
-// atomically via a Lua script. The optional reverse-lookup index by original
-// ID is written separately.
+//
+// When dedup is enabled and msg.OriginalID is non-empty, the operation is
+// routed through storeDedupScript which atomically upserts on the composite
+// (event_name, original_id) key. Otherwise the existing storeScript path is
+// used unchanged.
+//
+// The core non-dedup operations (hash write, time index, event index) are
+// executed atomically via storeScript. The optional reverse-lookup index by
+// original ID is written separately on the non-dedup path only (the dedup
+// script writes both indexes atomically).
 func (s *RedisStore) Store(ctx context.Context, msg *Message) error {
 	if msg == nil {
 		return fmt.Errorf("message is nil")
@@ -146,10 +251,37 @@ func (s *RedisStore) Store(ctx context.Context, msg *Message) error {
 		return fmt.Errorf("message ID is required")
 	}
 
-	msgKey := s.msgPrefix + msg.ID
-	eventKey := s.eventPrefix + msg.EventName
 	metadata, _ := json.Marshal(msg.Metadata)
 	score := msg.CreatedAt.Unix()
+	eventKey := s.eventPrefix + msg.EventName
+
+	// Dedup path: route through atomic upsert script.
+	if s.dedup && msg.OriginalID != "" {
+		compositeKey := s.eventOrigPrefix + msg.EventName + ":" + msg.OriginalID
+		argv := []interface{}{
+			s.msgPrefix,
+			s.timeKey,
+			eventKey,
+			s.retriedKey,
+			s.originalPrefix + msg.OriginalID,
+			score,
+			msg.ID,
+			msg.EventName,
+			msg.OriginalID,
+			msg.Error,
+			string(msg.Payload),
+			string(metadata),
+			msg.Source,
+			msg.RetryCount,
+		}
+		if _, err := storeDedupScript.Run(ctx, s.client, []string{compositeKey}, argv...).Result(); err != nil {
+			return fmt.Errorf("store dedup script: %w", err)
+		}
+		return nil
+	}
+
+	// Non-dedup path (existing behaviour — unchanged).
+	msgKey := s.msgPrefix + msg.ID
 
 	fieldPairs := []interface{}{
 		"id", msg.ID,
@@ -171,8 +303,7 @@ func (s *RedisStore) Store(ctx context.Context, msg *Message) error {
 	argv = append(argv, score)
 	argv = append(argv, msg.ID)
 
-	_, err := storeScript.Run(ctx, s.client, []string{msgKey, s.timeKey, eventKey}, argv...).Result()
-	if err != nil {
+	if _, err := storeScript.Run(ctx, s.client, []string{msgKey, s.timeKey, eventKey}, argv...).Result(); err != nil {
 		return fmt.Errorf("store script: %w", err)
 	}
 
@@ -244,6 +375,15 @@ func (s *RedisStore) parseMessage(fields map[string]string) (*Message, error) {
 		msg.RetriedAt = &t
 	}
 
+	if ts := fields["quarantined_at"]; ts != "" {
+		unix, err := strconv.ParseInt(ts, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("parse quarantined_at: %w", err)
+		}
+		t := time.Unix(unix, 0)
+		msg.QuarantinedAt = &t
+	}
+
 	return msg, nil
 }
 
@@ -304,6 +444,9 @@ func (s *RedisStore) List(ctx context.Context, filter Filter) ([]*Message, error
 		if filter.ExcludeRetried && msg.RetriedAt != nil {
 			continue
 		}
+		if filter.ExcludeQuarantined && msg.QuarantinedAt != nil {
+			continue
+		}
 		if filter.MaxRetries > 0 && msg.RetryCount > filter.MaxRetries {
 			continue
 		}
@@ -336,6 +479,7 @@ func (s *RedisStore) List(ctx context.Context, filter Filter) ([]*Message, error
 // ExcludeRetried filters are present.
 func (s *RedisStore) Count(ctx context.Context, filter Filter) (int64, error) {
 	hasComplexFilters := filter.ExcludeRetried ||
+		filter.ExcludeQuarantined ||
 		filter.MaxRetries > 0 ||
 		filter.Source != "" ||
 		filter.Error != ""
@@ -399,6 +543,46 @@ func (s *RedisStore) MarkRetried(ctx context.Context, id string) error {
 	return nil
 }
 
+// quarantineScript atomically marks a DLQ message as quarantined.
+//
+// KEYS[1] = message hash key (dlq:msg:{id})
+// KEYS[2] = quarantined set key (dlq:quarantined)
+//
+// ARGV[1] = message ID
+// ARGV[2] = quarantined_at unix timestamp
+//
+// Returns 1 on success, 0 if message not found.
+var quarantineScript = redis.NewScript(`
+local msgKey = KEYS[1]
+local quarantinedSetKey = KEYS[2]
+local msgID = ARGV[1]
+local quarantinedAt = ARGV[2]
+
+if redis.call('EXISTS', msgKey) == 0 then
+    return 0
+end
+
+redis.call('HSET', msgKey, 'quarantined_at', quarantinedAt)
+redis.call('SADD', quarantinedSetKey, msgID)
+
+return 1
+`)
+
+// Quarantine marks a message as a terminal, non-retryable failure.
+func (s *RedisStore) Quarantine(ctx context.Context, id string) error {
+	result, err := quarantineScript.Run(ctx, s.client,
+		[]string{s.msgPrefix + id, s.quarantinedKey},
+		id, time.Now().Unix(),
+	).Int64()
+	if err != nil {
+		return fmt.Errorf("quarantine script: %w", err)
+	}
+	if result == 0 {
+		return fmt.Errorf("%s: %w", id, ErrNotFound)
+	}
+	return nil
+}
+
 // Delete removes a message from the DLQ and all its index entries.
 func (s *RedisStore) Delete(ctx context.Context, id string) error {
 	msgKey := s.msgPrefix + id
@@ -427,6 +611,10 @@ func (s *RedisStore) Delete(ctx context.Context, id string) error {
 
 	if err := s.client.SRem(ctx, s.retriedKey, id).Err(); err != nil {
 		s.logger.Warn("failed to remove from retried set during delete", "id", id, "error", err)
+	}
+
+	if err := s.client.SRem(ctx, s.quarantinedKey, id).Err(); err != nil {
+		s.logger.Warn("failed to remove from quarantined set during delete", "id", id, "error", err)
 	}
 
 	if originalID := fields["original_id"]; originalID != "" {
@@ -489,7 +677,18 @@ func (s *RedisStore) Stats(ctx context.Context) (*Stats, error) {
 
 	retried, _ := s.client.SCard(ctx, s.retriedKey).Result()
 	stats.RetriedMessages = retried
-	stats.PendingMessages = total - retried
+
+	quarantined, _ := s.client.SCard(ctx, s.quarantinedKey).Result()
+	stats.QuarantinedMessages = quarantined
+
+	// Pending = total - |retried ∪ quarantined|: a message is pending iff it is
+	// neither retried nor quarantined. Computing the union cardinality avoids
+	// double-counting messages that are in both sets.
+	unionMembers, _ := s.client.SUnion(ctx, s.retriedKey, s.quarantinedKey).Result()
+	nonPending := int64(len(unionMembers))
+	if pending := total - nonPending; pending > 0 {
+		stats.PendingMessages = pending
+	}
 
 	// Enumerate event names via SCAN; ZCard each event sorted set.
 	var cursor uint64
@@ -564,7 +763,158 @@ func (s *RedisStore) Health(ctx context.Context) *health.Result {
 	}
 }
 
+// MigrateDedup collapses historical duplicate (event_name, original_id) groups
+// into a single entry each: keeps the newest by CreatedAt (tiebreak by ID),
+// sums RetryCount across the group, sets CreatedAt to the oldest in the group,
+// and sets QuarantinedAt to the earliest non-nil QuarantinedAt (if any).
+// The composite dedup index (eventOrigPrefix) and original-ID index are updated
+// to point to the survivor so that subsequent dedup-on writes collapse correctly.
+//
+// MigrateDedup refuses to delete more than 50% of all messages unless WithForce
+// is passed. Returns the number of non-survivor entries removed. Idempotent.
+func (s *RedisStore) MigrateDedup(ctx context.Context, opts ...MigrateDedupOption) (int64, error) {
+	o := applyMigrateDedupOptions(opts)
+
+	// 1. Enumerate all message IDs from the primary time index.
+	allIDs, err := s.client.ZRange(ctx, s.timeKey, 0, -1).Result()
+	if err != nil {
+		return 0, fmt.Errorf("zrange: %w", err)
+	}
+	total := int64(len(allIDs))
+
+	// 2. Fetch all messages.
+	msgs := make([]*Message, 0, len(allIDs))
+	for _, id := range allIDs {
+		fields, ferr := s.client.HGetAll(ctx, s.msgPrefix+id).Result()
+		if ferr != nil || len(fields) == 0 {
+			continue
+		}
+		m, perr := s.parseMessage(fields)
+		if perr != nil {
+			continue
+		}
+		msgs = append(msgs, m)
+	}
+
+	// 3. Group by (EventName, OriginalID) for messages with a non-empty OriginalID.
+	type groupKey struct{ event, orig string }
+	groups := make(map[groupKey][]*Message)
+	for _, m := range msgs {
+		if m.OriginalID == "" {
+			continue
+		}
+		k := groupKey{m.EventName, m.OriginalID}
+		groups[k] = append(groups[k], m)
+	}
+
+	// 4. Compute toDelete across multi-member groups only.
+	var toDelete int64
+	for _, g := range groups {
+		if len(g) > 1 {
+			toDelete += int64(len(g) - 1)
+		}
+	}
+
+	// 5. Safety guard.
+	if !o.force && total > 0 && toDelete*2 > total {
+		return 0, fmt.Errorf(
+			"dlq: MigrateDedup would delete %d of %d messages (>50%%); pass WithForce to proceed",
+			toDelete, total,
+		)
+	}
+
+	// 6. Collapse each multi-member group.
+	var removed int64
+	for k, group := range groups {
+		if len(group) <= 1 {
+			continue
+		}
+
+		// Identify the survivor: newest CreatedAt, tiebreak by ID (lexicographic).
+		survivor := group[0]
+		for _, m := range group[1:] {
+			if m.CreatedAt.After(survivor.CreatedAt) ||
+				(m.CreatedAt.Equal(survivor.CreatedAt) && m.ID > survivor.ID) {
+				survivor = m
+			}
+		}
+
+		// Compute aggregates across all group members.
+		var sumRetry int
+		minCreated := survivor.CreatedAt
+		var minQuarantined *time.Time
+		for _, m := range group {
+			sumRetry += m.RetryCount
+			if m.CreatedAt.Before(minCreated) {
+				minCreated = m.CreatedAt
+			}
+			if m.QuarantinedAt != nil {
+				if minQuarantined == nil || m.QuarantinedAt.Before(*minQuarantined) {
+					qt := *m.QuarantinedAt
+					minQuarantined = &qt
+				}
+			}
+		}
+
+		// Delete each non-survivor (reuse Delete which cleans all indexes).
+		for _, m := range group {
+			if m.ID == survivor.ID {
+				continue
+			}
+			// Delete removes originalPrefix+m.OriginalID too, but since all
+			// duplicates share the same OriginalID and we re-point it below,
+			// that is harmless.
+			if derr := s.Delete(ctx, m.ID); derr == nil {
+				removed++
+			}
+		}
+
+		// Update survivor hash with aggregated values.
+		survivorKey := s.msgPrefix + survivor.ID
+		hsetArgs := []interface{}{
+			"retry_count", sumRetry,
+			"created_at", minCreated.Unix(),
+		}
+		if minQuarantined != nil {
+			hsetArgs = append(hsetArgs, "quarantined_at", minQuarantined.Unix())
+			if aerr := s.client.SAdd(ctx, s.quarantinedKey, survivor.ID).Err(); aerr != nil {
+				s.logger.Warn("failed to add survivor to quarantined set", "id", survivor.ID, "error", aerr)
+			}
+		}
+		if herr := s.client.HSet(ctx, survivorKey, hsetArgs...).Err(); herr != nil {
+			return removed, fmt.Errorf("hset survivor %s: %w", survivor.ID, herr)
+		}
+
+		// Update primary time-index score to minCreated so ordering reflects first-seen.
+		if zerr := s.client.ZAdd(ctx, s.timeKey, redis.Z{
+			Score:  float64(minCreated.Unix()),
+			Member: survivor.ID,
+		}).Err(); zerr != nil {
+			s.logger.Warn("failed to update time index score for survivor", "id", survivor.ID, "error", zerr)
+		}
+		// Update per-event index score as well.
+		if zerr := s.client.ZAdd(ctx, s.eventPrefix+k.event, redis.Z{
+			Score:  float64(minCreated.Unix()),
+			Member: survivor.ID,
+		}).Err(); zerr != nil {
+			s.logger.Warn("failed to update event index score for survivor", "id", survivor.ID, "error", zerr)
+		}
+
+		// Point both composite and original indexes at the survivor.
+		compositeKey := s.eventOrigPrefix + k.event + ":" + k.orig
+		if serr := s.client.Set(ctx, compositeKey, survivor.ID, 0).Err(); serr != nil {
+			return removed, fmt.Errorf("set composite key %s: %w", compositeKey, serr)
+		}
+		if serr := s.client.Set(ctx, s.originalPrefix+k.orig, survivor.ID, 0).Err(); serr != nil {
+			return removed, fmt.Errorf("set original key %s: %w", k.orig, serr)
+		}
+	}
+
+	return removed, nil
+}
+
 // Compile-time checks
 var _ Store = (*RedisStore)(nil)
 var _ StatsProvider = (*RedisStore)(nil)
+var _ Quarantiner = (*RedisStore)(nil)
 var _ health.Checker = (*RedisStore)(nil)

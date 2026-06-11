@@ -3,6 +3,7 @@ package dlq
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -224,8 +225,8 @@ func TestRedisStore_List_TimeFilter(t *testing.T) {
 
 	t.Run("start and end time", func(t *testing.T) {
 		results, err := store.List(ctx, Filter{
-			After: base.Add(-90 * time.Minute),
-			Before:   base.Add(-30 * time.Minute),
+			After:  base.Add(-90 * time.Minute),
+			Before: base.Add(-30 * time.Minute),
 		})
 		require.NoError(t, err)
 		assert.Len(t, results, 1)
@@ -235,7 +236,7 @@ func TestRedisStore_List_TimeFilter(t *testing.T) {
 	t.Run("event name with time filter", func(t *testing.T) {
 		results, err := store.List(ctx, Filter{
 			EventName: "order.created",
-			After: base.Add(-90 * time.Minute),
+			After:     base.Add(-90 * time.Minute),
 		})
 		require.NoError(t, err)
 		assert.Len(t, results, 2)
@@ -470,8 +471,115 @@ func TestRedisStore_Stats(t *testing.T) {
 	assert.Equal(t, int64(3), stats.TotalMessages)
 	assert.Equal(t, int64(1), stats.RetriedMessages)
 	assert.Equal(t, int64(2), stats.PendingMessages)
+	assert.Equal(t, int64(0), stats.QuarantinedMessages)
 	assert.Equal(t, int64(2), stats.MessagesByEvent["order.created"])
 	assert.Equal(t, int64(1), stats.MessagesByEvent["order.updated"])
+}
+
+func TestRedisStore_Stats_Quarantine(t *testing.T) {
+	store, _ := setupRedisStore(t)
+	ctx := context.Background()
+
+	msgs := []*Message{
+		{ID: "sq-1", EventName: "order.created", Payload: []byte("p"), Error: "e", CreatedAt: time.Now()},
+		{ID: "sq-2", EventName: "order.created", Payload: []byte("p"), Error: "e", CreatedAt: time.Now()},
+		{ID: "sq-3", EventName: "order.created", Payload: []byte("p"), Error: "e", CreatedAt: time.Now()},
+	}
+	for _, m := range msgs {
+		require.NoError(t, store.Store(ctx, m))
+	}
+
+	// Quarantine one message; the pending count must drop by one.
+	require.NoError(t, store.Quarantine(ctx, "sq-1"))
+
+	stats, err := store.Stats(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, int64(3), stats.TotalMessages)
+	assert.Equal(t, int64(0), stats.RetriedMessages)
+	assert.Equal(t, int64(1), stats.QuarantinedMessages)
+	assert.Equal(t, int64(2), stats.PendingMessages)
+}
+
+func TestRedisStore_Quarantine(t *testing.T) {
+	store, _ := setupRedisStore(t)
+	ctx := context.Background()
+	now := time.Now()
+	if err := store.Store(ctx, &Message{ID: "m1", EventName: "e", OriginalID: "o1", CreatedAt: now}); err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	if err := store.Quarantine(ctx, "m1"); err != nil {
+		t.Fatalf("quarantine: %v", err)
+	}
+	got, err := store.Get(ctx, "m1")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.QuarantinedAt == nil {
+		t.Fatal("expected QuarantinedAt set")
+	}
+	list, _ := store.List(ctx, Filter{ExcludeQuarantined: true})
+	for _, m := range list {
+		if m.ID == "m1" {
+			t.Fatal("ExcludeQuarantined must hide quarantined message")
+		}
+	}
+	if err := store.Quarantine(ctx, "missing"); err == nil {
+		t.Fatal("expected error quarantining missing id")
+	}
+}
+
+func newRedisStoreDedup(t *testing.T) *RedisStore {
+	t.Helper()
+	mr := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	store, err := NewRedisStore(client, WithRedisDedup())
+	if err != nil {
+		t.Fatalf("new dedup store: %v", err)
+	}
+	return store
+}
+
+func TestRedisStore_Dedup(t *testing.T) {
+	ctx := context.Background()
+
+	// dedup OFF (default) => two distinct messages
+	off, _ := setupRedisStore(t)
+	_ = off.Store(ctx, &Message{ID: "a", EventName: "e", OriginalID: "o1", CreatedAt: time.Now()})
+	_ = off.Store(ctx, &Message{ID: "b", EventName: "e", OriginalID: "o1", CreatedAt: time.Now()})
+	if n, _ := off.Count(ctx, Filter{}); n != 2 {
+		t.Fatalf("dedup off: want 2, got %d", n)
+	}
+
+	// dedup ON => upsert on (event_name, original_id)
+	on := newRedisStoreDedup(t)
+	first := time.Now().Add(-time.Hour).Truncate(time.Second)
+	_ = on.Store(ctx, &Message{ID: "a", EventName: "e", OriginalID: "o1", Error: "err1", RetryCount: 3, CreatedAt: first})
+	_ = on.Store(ctx, &Message{ID: "b", EventName: "e", OriginalID: "o1", Error: "err2", RetryCount: 0, CreatedAt: time.Now()})
+	if n, _ := on.Count(ctx, Filter{}); n != 1 {
+		t.Fatalf("dedup on: want 1, got %d", n)
+	}
+	g, err := on.GetByOriginalID(ctx, "o1")
+	if err != nil {
+		t.Fatalf("getByOriginalID: %v", err)
+	}
+	if g.RetryCount != 4 {
+		t.Fatalf("retry_count: want 4, got %d", g.RetryCount)
+	}
+	if g.Error != "err2" {
+		t.Fatalf("error latest: want err2, got %q", g.Error)
+	}
+	// created_at is stored as unix seconds; compare at second granularity
+	if g.CreatedAt.Unix() != first.Unix() {
+		t.Fatalf("created_at preserved: want %v (%d), got %v (%d)", first, first.Unix(), g.CreatedAt, g.CreatedAt.Unix())
+	}
+
+	// empty OriginalID under dedup => distinct inserts (no composite key to deduplicate on)
+	on2 := newRedisStoreDedup(t)
+	_ = on2.Store(ctx, &Message{ID: "a", EventName: "e", OriginalID: "", CreatedAt: time.Now()})
+	_ = on2.Store(ctx, &Message{ID: "b", EventName: "e", OriginalID: "", CreatedAt: time.Now()})
+	if n, _ := on2.Count(ctx, Filter{}); n != 2 {
+		t.Fatalf("empty original under dedup: want 2, got %d", n)
+	}
 }
 
 func TestNewRedisStore_Options(t *testing.T) {
@@ -489,4 +597,69 @@ func TestNewRedisStore_Options(t *testing.T) {
 		assert.Equal(t, "custom:by_time", store.timeKey)
 		assert.Equal(t, "custom:msg:", store.msgPrefix)
 	})
+}
+
+func TestRedisStore_MigrateDedup(t *testing.T) {
+	ctx := context.Background()
+	mr := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	seeder, _ := NewRedisStore(client) // dedup OFF: inserts distinct rows
+	store, _ := NewRedisStore(client, WithRedisDedup())
+
+	old := time.Now().Add(-2 * time.Hour)
+	mid := time.Now().Add(-time.Hour)
+	newest := time.Now()
+	_ = seeder.Store(ctx, &Message{ID: "d1", EventName: "e", OriginalID: "o1", Error: "e1", RetryCount: 1, CreatedAt: mid})
+	_ = seeder.Store(ctx, &Message{ID: "d2", EventName: "e", OriginalID: "o1", Error: "e2", RetryCount: 2, CreatedAt: old})
+	_ = seeder.Store(ctx, &Message{ID: "d3", EventName: "e", OriginalID: "o1", Error: "e3", RetryCount: 3, CreatedAt: newest})
+	_ = seeder.Store(ctx, &Message{ID: "u1", EventName: "e", OriginalID: "o2", Error: "x", RetryCount: 5, CreatedAt: newest})
+
+	removed, err := store.MigrateDedup(ctx)
+	if err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	if removed != 2 {
+		t.Fatalf("want 2 removed, got %d", removed)
+	}
+	g, err := store.GetByOriginalID(ctx, "o1")
+	if err != nil {
+		t.Fatalf("survivor: %v", err)
+	}
+	if g.ID != "d3" {
+		t.Fatalf("want newest d3, got %s", g.ID)
+	}
+	if g.RetryCount != 6 {
+		t.Fatalf("want summed 6, got %d", g.RetryCount)
+	}
+	if g.CreatedAt.Unix() != old.Unix() {
+		t.Fatalf("want oldest created_at %d, got %d", old.Unix(), g.CreatedAt.Unix())
+	}
+	if n, _ := store.Count(ctx, Filter{}); n != 2 {
+		t.Fatalf("want 2 total, got %d", n)
+	}
+	// After migrate, a dedup store Store of same (e, o1) must collapse (composite index set).
+	_ = store.Store(ctx, &Message{ID: "x", EventName: "e", OriginalID: "o1", CreatedAt: time.Now()})
+	if n, _ := store.Count(ctx, Filter{}); n != 2 {
+		t.Fatalf("post-migrate dedup write must collapse: want 2, got %d", n)
+	}
+}
+
+func TestRedisStore_MigrateDedup_ForceGuard(t *testing.T) {
+	ctx := context.Background()
+	mr := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	seeder, _ := NewRedisStore(client)
+	store, _ := NewRedisStore(client, WithRedisDedup())
+	for i := 0; i < 4; i++ {
+		_ = seeder.Store(ctx, &Message{ID: fmt.Sprintf("d%d", i), EventName: "e", OriginalID: "o1", RetryCount: 1, CreatedAt: time.Now()})
+	}
+	if _, err := store.MigrateDedup(ctx); err == nil {
+		t.Fatal("expected guard error at >50%")
+	}
+	if _, err := store.MigrateDedup(ctx, WithForce()); err != nil {
+		t.Fatalf("force: %v", err)
+	}
+	if n, _ := store.Count(ctx, Filter{}); n != 1 {
+		t.Fatalf("after force want 1, got %d", n)
+	}
 }

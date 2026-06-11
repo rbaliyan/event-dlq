@@ -115,8 +115,8 @@ func runStoreContractTests(t *testing.T, store Store) {
 	t.Run("List/TimeRange", func(t *testing.T) {
 		// between base-3h and base-1h: c-2, c-3, c-4 = 3
 		results, err := store.List(ctx, Filter{
-			After: base.Add(-3 * time.Hour),
-			Before:   base.Add(-1 * time.Hour),
+			After:  base.Add(-3 * time.Hour),
+			Before: base.Add(-1 * time.Hour),
 		})
 		require.NoError(t, err)
 		assert.Len(t, results, 3)
@@ -126,7 +126,7 @@ func runStoreContractTests(t *testing.T, store Store) {
 		// order.created from base-3h onward: c-2, c-5 = 2
 		results, err := store.List(ctx, Filter{
 			EventName: "order.created",
-			After: base.Add(-3 * time.Hour),
+			After:     base.Add(-3 * time.Hour),
 		})
 		require.NoError(t, err)
 		assert.Len(t, results, 2)
@@ -281,6 +281,53 @@ func runStoreContractTests(t *testing.T, store Store) {
 
 	t.Run("Delete/NotFound", func(t *testing.T) {
 		err := store.Delete(ctx, "no-such-message")
+		require.Error(t, err)
+		assert.ErrorIs(t, err, ErrNotFound)
+	})
+
+	t.Run("Quarantine/SetsFieldAndExcludes", func(t *testing.T) {
+		q, ok := store.(Quarantiner)
+		if !ok {
+			t.Skip("store does not implement Quarantiner")
+		}
+		id := "quar-1"
+		require.NoError(t, store.Store(ctx, &Message{
+			ID: id, EventName: "quar.evt", OriginalID: "quar-o1",
+			Payload: []byte(`{}`), Error: "x", CreatedAt: time.Now(),
+		}), "seed quar-1")
+		defer func() { _ = store.Delete(ctx, id) }()
+
+		require.NoError(t, q.Quarantine(ctx, id))
+
+		got, err := store.Get(ctx, id)
+		require.NoError(t, err)
+		assert.NotNil(t, got.QuarantinedAt, "expected QuarantinedAt set after Quarantine")
+
+		// ExcludeQuarantined must hide it.
+		list, err := store.List(ctx, Filter{EventName: "quar.evt", ExcludeQuarantined: true})
+		require.NoError(t, err)
+		for _, m := range list {
+			assert.NotEqual(t, id, m.ID, "ExcludeQuarantined must hide quarantined message")
+		}
+
+		// Without the flag it is still listed.
+		all, err := store.List(ctx, Filter{EventName: "quar.evt"})
+		require.NoError(t, err)
+		found := false
+		for _, m := range all {
+			if m.ID == id {
+				found = true
+			}
+		}
+		assert.True(t, found, "quarantined message must still be listed without ExcludeQuarantined")
+	})
+
+	t.Run("Quarantine/NotFound", func(t *testing.T) {
+		q, ok := store.(Quarantiner)
+		if !ok {
+			t.Skip("store does not implement Quarantiner")
+		}
+		err := q.Quarantine(ctx, "does-not-exist")
 		require.Error(t, err)
 		assert.ErrorIs(t, err, ErrNotFound)
 	})

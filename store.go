@@ -93,16 +93,17 @@ var ErrNotFound = fmt.Errorf("dlq message %w", eventerrors.ErrNotFound)
 // A DLQ message contains the original message data along with metadata
 // about the failure, enabling debugging and replay.
 type Message struct {
-	ID         string            // Unique DLQ message ID (generated)
-	EventName  string            // Original event name/topic
-	OriginalID string            // Original message ID for correlation
-	Payload    []byte            // Original message payload
-	Metadata   map[string]string // Original message metadata
-	Error      string            // Error that caused the failure
-	RetryCount int               // Number of retries attempted before DLQ
-	CreatedAt  time.Time         // When the message was added to DLQ
-	RetriedAt  *time.Time        // When the message was last replayed (nil if never)
-	Source     string            // Source system/service that produced the error
+	ID            string            // Unique DLQ message ID (generated)
+	EventName     string            // Original event name/topic
+	OriginalID    string            // Original message ID for correlation
+	Payload       []byte            // Original message payload
+	Metadata      map[string]string // Original message metadata
+	Error         string            // Error that caused the failure
+	RetryCount    int               // Number of retries attempted before DLQ
+	CreatedAt     time.Time         // When the message was added to DLQ
+	RetriedAt     *time.Time        // When the message was last replayed (nil if never)
+	QuarantinedAt *time.Time        // When Replay classified this as terminal (nil if not quarantined)
+	Source        string            // Source system/service that produced the error
 }
 
 // Filter specifies criteria for listing DLQ messages.
@@ -119,15 +120,16 @@ type Message struct {
 //	    Limit:          100,
 //	}
 type Filter struct {
-	EventName      string    // Filter by event name (empty = all events)
-	After          time.Time // Filter messages received after this time (zero = no minimum)
-	Before         time.Time // Filter messages received before this time (zero = no maximum)
-	Error          string    // Filter by error message (contains match)
-	MaxRetries     int       // Filter by retry count (0 = no limit)
-	Source         string    // Filter by source service (empty = all sources)
-	ExcludeRetried bool      // Exclude already replayed messages
-	Limit          int       // Maximum results (0 = no limit)
-	Offset         int       // Offset for pagination
+	EventName          string    // Filter by event name (empty = all events)
+	After              time.Time // Filter messages received after this time (zero = no minimum)
+	Before             time.Time // Filter messages received before this time (zero = no maximum)
+	Error              string    // Filter by error message (contains match)
+	MaxRetries         int       // Filter by retry count (0 = no limit)
+	Source             string    // Filter by source service (empty = all sources)
+	ExcludeRetried     bool      // Exclude already replayed messages
+	ExcludeQuarantined bool      // Exclude quarantined (terminal) messages
+	Limit              int       // Maximum results (0 = no limit)
+	Offset             int       // Offset for pagination
 }
 
 // Store defines the interface for DLQ storage.
@@ -180,13 +182,14 @@ type Store interface {
 //
 // Used for monitoring and alerting on DLQ health.
 type Stats struct {
-	TotalMessages   int64            // Total messages in DLQ
-	MessagesByEvent map[string]int64 // Count per event type
-	MessagesByError map[string]int64 // Count per error type
-	OldestMessage   *time.Time       // Timestamp of oldest message
-	NewestMessage   *time.Time       // Timestamp of newest message
-	RetriedMessages int64            // Messages that have been replayed
-	PendingMessages int64            // Messages awaiting replay
+	TotalMessages       int64            // Total messages in DLQ
+	MessagesByEvent     map[string]int64 // Count per event type
+	MessagesByError     map[string]int64 // Count per error type
+	OldestMessage       *time.Time       // Timestamp of oldest message
+	NewestMessage       *time.Time       // Timestamp of newest message
+	RetriedMessages     int64            // Messages that have been replayed
+	PendingMessages     int64            // Messages awaiting replay
+	QuarantinedMessages int64            // Messages quarantined as terminal (non-retryable)
 }
 
 // StatsProvider is an optional interface for stores that support statistics.
@@ -196,4 +199,15 @@ type Stats struct {
 type StatsProvider interface {
 	// Stats returns DLQ statistics.
 	Stats(ctx context.Context) (*Stats, error)
+}
+
+// Quarantiner is an optional interface for stores that can mark a message as
+// quarantined (a terminal, non-retryable failure). Stores implementing it allow
+// Manager.Replay to quarantine such messages instead of republishing them.
+// Detected via type assertion, like StatsProvider, so it is not a required part
+// of the Store interface and adding it breaks no existing implementer.
+type Quarantiner interface {
+	// Quarantine sets QuarantinedAt to the current time for the given message.
+	// Returns ErrNotFound if no message with that ID exists.
+	Quarantine(ctx context.Context, id string) error
 }

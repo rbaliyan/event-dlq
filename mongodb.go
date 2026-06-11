@@ -55,47 +55,50 @@ db.event_dlq.createIndex({ "event_name": 1, "created_at": 1 })
 
 // mongoMessage represents a DLQ message document in MongoDB
 type mongoMessage struct {
-	ID         string            `bson:"_id"`
-	EventName  string            `bson:"event_name"`
-	OriginalID string            `bson:"original_id"`
-	Payload    []byte            `bson:"payload"`
-	Metadata   map[string]string `bson:"metadata,omitempty"`
-	Error      string            `bson:"error"`
-	RetryCount int               `bson:"retry_count"`
-	Source     string            `bson:"source,omitempty"`
-	CreatedAt  time.Time         `bson:"created_at"`
-	RetriedAt  *time.Time        `bson:"retried_at,omitempty"`
+	ID            string            `bson:"_id"`
+	EventName     string            `bson:"event_name"`
+	OriginalID    string            `bson:"original_id"`
+	Payload       []byte            `bson:"payload"`
+	Metadata      map[string]string `bson:"metadata,omitempty"`
+	Error         string            `bson:"error"`
+	RetryCount    int               `bson:"retry_count"`
+	Source        string            `bson:"source,omitempty"`
+	CreatedAt     time.Time         `bson:"created_at"`
+	RetriedAt     *time.Time        `bson:"retried_at,omitempty"`
+	QuarantinedAt *time.Time        `bson:"quarantined_at,omitempty"`
 }
 
 // toMessage converts mongoMessage to Message
 func (m *mongoMessage) toMessage() *Message {
 	return &Message{
-		ID:         m.ID,
-		EventName:  m.EventName,
-		OriginalID: m.OriginalID,
-		Payload:    m.Payload,
-		Metadata:   m.Metadata,
-		Error:      m.Error,
-		RetryCount: m.RetryCount,
-		Source:     m.Source,
-		CreatedAt:  m.CreatedAt,
-		RetriedAt:  m.RetriedAt,
+		ID:            m.ID,
+		EventName:     m.EventName,
+		OriginalID:    m.OriginalID,
+		Payload:       m.Payload,
+		Metadata:      m.Metadata,
+		Error:         m.Error,
+		RetryCount:    m.RetryCount,
+		Source:        m.Source,
+		CreatedAt:     m.CreatedAt,
+		RetriedAt:     m.RetriedAt,
+		QuarantinedAt: m.QuarantinedAt,
 	}
 }
 
 // fromMessage creates a mongoMessage from Message
 func fromMessage(m *Message) *mongoMessage {
 	return &mongoMessage{
-		ID:         m.ID,
-		EventName:  m.EventName,
-		OriginalID: m.OriginalID,
-		Payload:    m.Payload,
-		Metadata:   m.Metadata,
-		Error:      m.Error,
-		RetryCount: m.RetryCount,
-		Source:     m.Source,
-		CreatedAt:  m.CreatedAt,
-		RetriedAt:  m.RetriedAt,
+		ID:            m.ID,
+		EventName:     m.EventName,
+		OriginalID:    m.OriginalID,
+		Payload:       m.Payload,
+		Metadata:      m.Metadata,
+		Error:         m.Error,
+		RetryCount:    m.RetryCount,
+		Source:        m.Source,
+		CreatedAt:     m.CreatedAt,
+		RetriedAt:     m.RetriedAt,
+		QuarantinedAt: m.QuarantinedAt,
 	}
 }
 
@@ -113,6 +116,7 @@ type MongoStoreOption func(*mongoStoreOptions)
 
 type mongoStoreOptions struct {
 	collection string
+	dedup      bool
 }
 
 // WithCollection sets a custom collection name.
@@ -124,9 +128,18 @@ func WithCollection(name string) MongoStoreOption {
 	}
 }
 
+// WithMongoDedup enables upsert-on-(EventName, OriginalID): re-storing a message
+// with the same event name and (non-empty) original ID increments retry_count on
+// the existing document instead of inserting a new one. Default: off (backward
+// compatible — existing callers see no change).
+func WithMongoDedup() MongoStoreOption {
+	return func(o *mongoStoreOptions) { o.dedup = true }
+}
+
 // MongoStore is a MongoDB-based DLQ store
 type MongoStore struct {
 	collection *mongo.Collection
+	dedup      bool        // Whether dedup upsert is enabled (off by default)
 	cappedMu   sync.Mutex  // Protects capped fields
 	cappedDone bool        // Whether capped info has been fetched
 	cappedInfo *cappedInfo // Cached capped info (nil = not checked yet)
@@ -149,6 +162,7 @@ func NewMongoStore(db *mongo.Database, opts ...MongoStoreOption) (*MongoStore, e
 
 	s := &MongoStore{
 		collection: db.Collection(o.collection),
+		dedup:      o.dedup,
 	}
 	go func() { // #nosec G118 — background goroutine intentionally outlives constructor context
 		if err := s.EnsureIndexes(context.Background()); err != nil {
@@ -200,12 +214,39 @@ func (s *MongoStore) Indexes() []mongo.IndexModel {
 // index, which cannot serve {retried_at: nil} queries (pending messages omit the
 // field) and conflicts with the non-sparse definition this version creates. Any
 // pre-existing sparse retried_at index is dropped first so it can be recreated.
+//
+// When dedup is enabled (WithMongoDedup), a unique index on (event_name,
+// original_id) is created in a separate, failure-tolerant step. If the collection
+// still contains legacy duplicate pairs the index creation will fail; run
+// MigrateDedup to collapse duplicates first, then call EnsureIndexes again.
+// When dedup is disabled (the default), no unique index is created, so multiple
+// DLQ entries for the same (event_name, original_id) are permitted.
 func (s *MongoStore) EnsureIndexes(ctx context.Context) error {
 	if err := s.dropLegacySparseRetriedIndex(ctx); err != nil {
 		return err
 	}
-	_, err := s.collection.Indexes().CreateMany(ctx, s.Indexes())
-	return err
+	if _, err := s.collection.Indexes().CreateMany(ctx, s.Indexes()); err != nil {
+		return err
+	}
+
+	// Unique dedup index on (event_name, original_id). Only created when dedup is
+	// enabled: with dedup off, multiple DLQ entries for the same (event_name,
+	// original_id) are allowed and expected, so no unique constraint must exist.
+	// Created best-effort: on a collection that still contains legacy duplicates
+	// this fails, which is expected — callers run MigrateDedup to collapse
+	// duplicates first. A failure here must NOT break index bootstrap, so we log
+	// and continue.
+	if s.dedup {
+		uniqModel := mongo.IndexModel{
+			Keys:    bson.D{{Key: "event_name", Value: 1}, {Key: "original_id", Value: 1}},
+			Options: options.Index().SetUnique(true).SetName("uniq_event_original"),
+		}
+		if _, err := s.collection.Indexes().CreateOne(ctx, uniqModel); err != nil {
+			slog.Default().Warn("dlq: unique dedup index not created (legacy duplicates?); run MigrateDedup",
+				"collection", s.collection.Name(), "error", err)
+		}
+	}
+	return nil
 }
 
 // dropLegacySparseRetriedIndex removes a pre-existing sparse retried_at_1 index so
@@ -344,7 +385,10 @@ func (s *MongoStore) CreateCapped(ctx context.Context, sizeBytes int64, maxDocs 
 	return nil
 }
 
-// Store adds a message to the DLQ
+// Store adds a message to the DLQ. When dedup is enabled and msg.OriginalID is
+// non-empty, a duplicate (EventName, OriginalID) pair upserts the existing
+// document: RetryCount is incremented, Error/Payload/Metadata are updated to the
+// latest values, RetriedAt is cleared, and CreatedAt is preserved as first-seen.
 func (s *MongoStore) Store(ctx context.Context, msg *Message) error {
 	if msg == nil {
 		return fmt.Errorf("message is nil")
@@ -352,17 +396,48 @@ func (s *MongoStore) Store(ctx context.Context, msg *Message) error {
 	if msg.ID == "" {
 		return fmt.Errorf("message ID is required")
 	}
-
-	mongoMsg := fromMessage(msg)
-
-	_, err := s.collection.InsertOne(ctx, mongoMsg)
-	if err != nil {
+	if s.dedup && msg.OriginalID != "" {
+		return s.upsertDedup(ctx, msg)
+	}
+	doc := fromMessage(msg)
+	if _, err := s.collection.InsertOne(ctx, doc); err != nil {
 		if mongo.IsDuplicateKeyError(err) {
 			return fmt.Errorf("message already exists: %s", msg.ID)
 		}
 		return fmt.Errorf("insert: %w", err)
 	}
+	return nil
+}
 
+// upsertDedup collapses re-stores of the same (event_name, original_id) into one
+// document: increments retry_count, updates error/payload/metadata to the latest,
+// preserves the first-seen created_at, and clears retried_at. Uses an aggregation
+// pipeline so the same retry_count field can be initialized on insert and
+// incremented on update without a conflicting-operator error.
+func (s *MongoStore) upsertDedup(ctx context.Context, msg *Message) error {
+	filter := bson.M{"event_name": msg.EventName, "original_id": msg.OriginalID}
+	pipeline := mongo.Pipeline{
+		bson.D{{Key: "$set", Value: bson.M{
+			"retry_count": bson.M{"$cond": bson.A{
+				bson.M{"$eq": bson.A{bson.M{"$type": "$retry_count"}, "missing"}},
+				msg.RetryCount,
+				bson.M{"$add": bson.A{"$retry_count", 1}},
+			}},
+			"_id":         bson.M{"$ifNull": bson.A{"$_id", msg.ID}},
+			"event_name":  msg.EventName,
+			"original_id": msg.OriginalID,
+			"error":       msg.Error,
+			"payload":     msg.Payload,
+			"metadata":    msg.Metadata,
+			"source":      bson.M{"$ifNull": bson.A{"$source", msg.Source}},
+			"created_at":  bson.M{"$ifNull": bson.A{"$created_at", msg.CreatedAt}},
+			"retried_at":  nil,
+		}}},
+	}
+	opts := options.UpdateOne().SetUpsert(true)
+	if _, err := s.collection.UpdateOne(ctx, filter, mongo.Pipeline(pipeline), opts); err != nil {
+		return fmt.Errorf("upsert dedup: %w", err)
+	}
 	return nil
 }
 
@@ -457,6 +532,10 @@ func (s *MongoStore) buildFilter(filter Filter) bson.M {
 		mongoFilter["retried_at"] = nil
 	}
 
+	if filter.ExcludeQuarantined {
+		mongoFilter["quarantined_at"] = nil
+	}
+
 	return mongoFilter
 }
 
@@ -473,6 +552,28 @@ func (s *MongoStore) MarkRetried(ctx context.Context, id string) error {
 	result, err := s.collection.UpdateOne(ctx, filter, update)
 	if err != nil {
 		return fmt.Errorf("update: %w", err)
+	}
+
+	if result.MatchedCount == 0 {
+		return fmt.Errorf("%s: %w", id, ErrNotFound)
+	}
+
+	return nil
+}
+
+// Quarantine marks a message as a terminal, non-retryable failure.
+func (s *MongoStore) Quarantine(ctx context.Context, id string) error {
+	now := time.Now()
+	filter := bson.M{"_id": id}
+	update := bson.M{
+		"$set": bson.M{
+			"quarantined_at": now,
+		},
+	}
+
+	result, err := s.collection.UpdateOne(ctx, filter, update)
+	if err != nil {
+		return fmt.Errorf("quarantine: %w", err)
 	}
 
 	if result.MatchedCount == 0 {
@@ -573,18 +674,26 @@ func (s *MongoStore) Stats(ctx context.Context) (*Stats, error) {
 	}
 	stats.TotalMessages = total
 
-	// Pending count (not retried). Exact and index-backed: the non-sparse retried_at
-	// index serves this equality-on-null predicate via a COUNT_SCAN.
-	pending, err := s.collection.CountDocuments(ctx, bson.M{"retried_at": nil})
+	// Pending count: not retried AND not quarantined. Exact and index-backed.
+	pending, err := s.collection.CountDocuments(ctx, bson.M{"retried_at": nil, "quarantined_at": nil})
 	if err != nil {
 		return nil, fmt.Errorf("count pending: %w", err)
 	}
 	stats.PendingMessages = pending
-	// total is an estimate while pending is exact, so the subtraction can briefly go
-	// negative around concurrent writes; clamp to keep the reported figure sane.
-	if retried := total - pending; retried > 0 {
-		stats.RetriedMessages = retried
+
+	// Quarantined count: messages marked as terminal (non-retryable).
+	quarantined, err := s.collection.CountDocuments(ctx, bson.M{"quarantined_at": bson.M{"$ne": nil}})
+	if err != nil {
+		return nil, fmt.Errorf("count quarantined: %w", err)
 	}
+	stats.QuarantinedMessages = quarantined
+
+	// Retried count: messages that have been replayed.
+	retried, err := s.collection.CountDocuments(ctx, bson.M{"retried_at": bson.M{"$ne": nil}})
+	if err != nil {
+		return nil, fmt.Errorf("count retried: %w", err)
+	}
+	stats.RetriedMessages = retried
 
 	// Count by event using aggregation
 	eventPipeline := mongo.Pipeline{
@@ -697,7 +806,111 @@ func (s *MongoStore) Health(ctx context.Context) *health.Result {
 	}
 }
 
+// MigrateDedup collapses historical duplicate (event_name, original_id) groups
+// into a single document: the newest document by created_at is kept as the
+// survivor; its retry_count is replaced with the sum of all duplicates' counts;
+// its created_at is set to the oldest in the group; and the earliest
+// quarantined_at (if any document in the group was quarantined) is propagated.
+// After all duplicates are resolved, the unique (event_name, original_id) index
+// is created via EnsureIndexes.
+//
+// Safety guard: if collapsing would delete more than 50% of all documents in the
+// collection, MigrateDedup returns an error without modifying anything. Pass
+// WithForce to skip the guard. This protects against accidentally running the
+// migration against the wrong collection.
+//
+// MigrateDedup is idempotent: a second call on a clean (already-deduplicated)
+// collection removes 0 documents and re-runs EnsureIndexes (which is a no-op
+// when the index already exists).
+//
+// Returns the number of documents removed.
+func (s *MongoStore) MigrateDedup(ctx context.Context, opts ...MigrateDedupOption) (int64, error) {
+	o := applyMigrateDedupOptions(opts)
+
+	total, err := s.collection.CountDocuments(ctx, bson.M{})
+	if err != nil {
+		return 0, fmt.Errorf("count: %w", err)
+	}
+
+	// Find all groups of (event_name, original_id) that have more than one document.
+	// Sort by created_at ascending so $push produces IDs in oldest-first order;
+	// the last element in each group is the newest (survivor).
+	cursor, err := s.collection.Aggregate(ctx, mongo.Pipeline{
+		bson.D{{Key: "$match", Value: bson.M{"original_id": bson.M{"$ne": ""}}}},
+		bson.D{{Key: "$sort", Value: bson.D{{Key: "created_at", Value: 1}}}},
+		bson.D{{Key: "$group", Value: bson.M{
+			"_id":            bson.M{"event_name": "$event_name", "original_id": "$original_id"},
+			"ids":            bson.M{"$push": "$_id"},
+			"sumRetry":       bson.M{"$sum": "$retry_count"},
+			"minCreated":     bson.M{"$min": "$created_at"},
+			"minQuarantined": bson.M{"$min": "$quarantined_at"},
+			"count":          bson.M{"$sum": 1},
+		}}},
+		bson.D{{Key: "$match", Value: bson.M{"count": bson.M{"$gt": 1}}}},
+	})
+	if err != nil {
+		return 0, fmt.Errorf("aggregate duplicates: %w", err)
+	}
+	defer func() { _ = cursor.Close(ctx) }()
+
+	type group struct {
+		IDs            []string   `bson:"ids"`
+		SumRetry       int        `bson:"sumRetry"`
+		MinCreated     time.Time  `bson:"minCreated"`
+		MinQuarantined *time.Time `bson:"minQuarantined"`
+	}
+	var groups []group
+	if err := cursor.All(ctx, &groups); err != nil {
+		return 0, fmt.Errorf("decode groups: %w", err)
+	}
+
+	// Count how many documents would be deleted (all but the survivor in each group).
+	var toDelete int64
+	for _, g := range groups {
+		toDelete += int64(len(g.IDs) - 1)
+	}
+
+	if !o.force && total > 0 && toDelete*2 > total {
+		return 0, fmt.Errorf(
+			"dlq: MigrateDedup would delete %d of %d documents (>50%%); pass WithForce to proceed",
+			toDelete, total,
+		)
+	}
+
+	var removed int64
+	for _, g := range groups {
+		// IDs are sorted oldest→newest by the $sort + $push; keep the newest (last).
+		keep := g.IDs[len(g.IDs)-1]
+		drop := g.IDs[:len(g.IDs)-1]
+
+		set := bson.M{
+			"retry_count": g.SumRetry,
+			"created_at":  g.MinCreated,
+		}
+		if g.MinQuarantined != nil {
+			set["quarantined_at"] = *g.MinQuarantined
+		}
+
+		if _, err := s.collection.UpdateByID(ctx, keep, bson.M{"$set": set}); err != nil {
+			return removed, fmt.Errorf("update survivor %q: %w", keep, err)
+		}
+
+		res, err := s.collection.DeleteMany(ctx, bson.M{"_id": bson.M{"$in": drop}})
+		if err != nil {
+			return removed, fmt.Errorf("delete duplicates: %w", err)
+		}
+		removed += res.DeletedCount
+	}
+
+	// Create the unique (event_name, original_id) index now that duplicates are gone.
+	if err := s.EnsureIndexes(ctx); err != nil {
+		return removed, fmt.Errorf("ensure indexes after dedup: %w", err)
+	}
+	return removed, nil
+}
+
 // Compile-time checks
 var _ Store = (*MongoStore)(nil)
 var _ StatsProvider = (*MongoStore)(nil)
 var _ health.Checker = (*MongoStore)(nil)
+var _ Quarantiner = (*MongoStore)(nil)

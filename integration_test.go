@@ -5,12 +5,14 @@ package dlq
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"os"
 	"testing"
 	"time"
 
 	_ "github.com/lib/pq"
 	"github.com/rbaliyan/event/v3/health"
+	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
@@ -244,4 +246,451 @@ func TestPostgresStoreIntegration(t *testing.T) {
 	})
 
 	runStoreContractTests(t, store)
+}
+
+func TestMongoStoreDedup(t *testing.T) {
+	client := getMongoClient(t)
+	ctx := context.Background()
+
+	dbName := "dlq_dedup_test_" + time.Now().Format("20060102150405")
+	db := client.Database(dbName)
+	t.Cleanup(func() { db.Drop(context.Background()) })
+
+	// dedup OFF => two distinct docs
+	off, err := NewMongoStore(db, WithCollection("dlq_dedup_off_test"))
+	if err != nil {
+		t.Fatalf("NewMongoStore (off): %v", err)
+	}
+	_ = off.Collection().Drop(ctx)
+	t.Cleanup(func() { _ = off.Collection().Drop(ctx) })
+	// Ensure index bootstrap has run so the assertion is not a race: with dedup
+	// OFF there must be NO unique index, so duplicate (event,original) inserts
+	// are allowed even after EnsureIndexes completes.
+	if err := off.EnsureIndexes(ctx); err != nil {
+		t.Fatalf("ensure indexes: %v", err)
+	}
+	_ = off.Store(ctx, &Message{ID: "a", EventName: "e", OriginalID: "o1", CreatedAt: time.Now()})
+	if err := off.Store(ctx, &Message{ID: "b", EventName: "e", OriginalID: "o1", CreatedAt: time.Now()}); err != nil {
+		t.Fatalf("dedup off: second insert of same (event,original) must succeed, got: %v", err)
+	}
+	if n, _ := off.Count(ctx, Filter{}); n != 2 {
+		t.Fatalf("dedup off: want 2, got %d", n)
+	}
+
+	// dedup ON => upsert
+	on, err := NewMongoStore(db, WithCollection("dlq_dedup_on_test"), WithMongoDedup())
+	if err != nil {
+		t.Fatalf("NewMongoStore (on): %v", err)
+	}
+	_ = on.Collection().Drop(ctx)
+	t.Cleanup(func() { _ = on.Collection().Drop(ctx) })
+	if err := on.EnsureIndexes(ctx); err != nil {
+		t.Fatalf("EnsureIndexes: %v", err)
+	}
+	first := time.Now().Add(-time.Hour).Truncate(time.Millisecond)
+	_ = on.Store(ctx, &Message{ID: "a", EventName: "e", OriginalID: "o1", Error: "err1", RetryCount: 3, CreatedAt: first})
+	_ = on.Store(ctx, &Message{ID: "b", EventName: "e", OriginalID: "o1", Error: "err2", RetryCount: 0, CreatedAt: time.Now()})
+	if n, _ := on.Count(ctx, Filter{}); n != 1 {
+		t.Fatalf("dedup on: want 1, got %d", n)
+	}
+	list, err := on.List(ctx, Filter{})
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(list) == 0 {
+		t.Fatal("list returned no messages")
+	}
+	g := list[0]
+	if g.RetryCount != 4 {
+		t.Fatalf("retry_count: want 4, got %d", g.RetryCount)
+	}
+	if g.Error != "err2" {
+		t.Fatalf("error latest: want err2, got %q", g.Error)
+	}
+	if !g.CreatedAt.UTC().Equal(first.UTC()) {
+		t.Fatalf("created_at preserved: want %v, got %v", first.UTC(), g.CreatedAt.UTC())
+	}
+	if g.RetriedAt != nil {
+		t.Fatal("retried_at must be nil after upsert")
+	}
+
+	// empty OriginalID => distinct under dedup
+	on2, err := NewMongoStore(db, WithCollection("dlq_dedup_empty_test"), WithMongoDedup())
+	if err != nil {
+		t.Fatalf("NewMongoStore (on2): %v", err)
+	}
+	_ = on2.Collection().Drop(ctx)
+	t.Cleanup(func() { _ = on2.Collection().Drop(ctx) })
+	_ = on2.Store(ctx, &Message{ID: "a", EventName: "e", OriginalID: "", CreatedAt: time.Now()})
+	_ = on2.Store(ctx, &Message{ID: "b", EventName: "e", OriginalID: "", CreatedAt: time.Now()})
+	if n, _ := on2.Count(ctx, Filter{}); n != 2 {
+		t.Fatalf("empty original under dedup: want 2, got %d", n)
+	}
+}
+
+func TestMongoStoreMigrateDedup(t *testing.T) {
+	client := getMongoClient(t)
+	ctx := context.Background()
+
+	dbName := "dlq_migrate_test_" + time.Now().Format("20060102150405")
+	db := client.Database(dbName)
+	t.Cleanup(func() { _ = db.Drop(context.Background()) })
+
+	store, err := NewMongoStore(db, WithCollection("dlq_migrate_test"), WithMongoDedup())
+	if err != nil {
+		t.Fatalf("NewMongoStore: %v", err)
+	}
+	coll := store.Collection()
+	_ = coll.Drop(ctx)
+	t.Cleanup(func() { _ = coll.Drop(ctx) })
+
+	// Seed 3 duplicate docs for (e, o1) with distinct _ids, plus 1 unique (e, o2).
+	// Insert directly via the collection to bypass the dedup upsert path.
+	old := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
+	mid := time.Now().Add(-1 * time.Hour).UTC().Truncate(time.Millisecond)
+	newest := time.Now().UTC().Truncate(time.Millisecond)
+	docs := []interface{}{
+		bson.M{"_id": "d1", "event_name": "e", "original_id": "o1", "error": "e1", "retry_count": 1, "created_at": mid},
+		bson.M{"_id": "d2", "event_name": "e", "original_id": "o1", "error": "e2", "retry_count": 2, "created_at": old},
+		bson.M{"_id": "d3", "event_name": "e", "original_id": "o1", "error": "e3", "retry_count": 3, "created_at": newest},
+		bson.M{"_id": "u1", "event_name": "e", "original_id": "o2", "error": "x", "retry_count": 5, "created_at": newest},
+	}
+	if _, err := coll.InsertMany(ctx, docs); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	// Without force, deleting 2 of 4 rows (50%) is allowed (guard triggers only at >50%).
+	removed, err := store.MigrateDedup(ctx)
+	if err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	if removed != 2 {
+		t.Fatalf("want 2 removed, got %d", removed)
+	}
+
+	// One survivor for (e,o1): newest doc (d3) kept, retry_count summed = 6, created_at = oldest.
+	survivor, err := store.GetByOriginalID(ctx, "o1")
+	if err != nil {
+		t.Fatalf("get survivor: %v", err)
+	}
+	if survivor.ID != "d3" {
+		t.Fatalf("expected newest doc d3 kept, got %s", survivor.ID)
+	}
+	if survivor.RetryCount != 6 {
+		t.Fatalf("expected summed retry_count 6, got %d", survivor.RetryCount)
+	}
+	if !survivor.CreatedAt.UTC().Equal(old) {
+		t.Fatalf("expected oldest created_at %v, got %v", old, survivor.CreatedAt.UTC())
+	}
+
+	if n, _ := store.Count(ctx, Filter{}); n != 2 {
+		t.Fatalf("expected 2 docs total after migrate, got %d", n)
+	}
+
+	// Unique index now present: a raw duplicate insert for (e,o1) must fail.
+	_, err = coll.InsertOne(ctx, bson.M{"_id": "dup", "event_name": "e", "original_id": "o1", "created_at": newest})
+	if err == nil {
+		t.Fatal("expected duplicate-key error after unique index created")
+	}
+}
+
+func TestMongoStoreMigrateDedup_ForceGuard(t *testing.T) {
+	client := getMongoClient(t)
+	ctx := context.Background()
+
+	dbName := "dlq_migrate_guard_test_" + time.Now().Format("20060102150405")
+	db := client.Database(dbName)
+	t.Cleanup(func() { _ = db.Drop(context.Background()) })
+
+	store, err := NewMongoStore(db, WithCollection("dlq_migrate_guard_test"), WithMongoDedup())
+	if err != nil {
+		t.Fatalf("NewMongoStore: %v", err)
+	}
+	coll := store.Collection()
+	_ = coll.Drop(ctx)
+	t.Cleanup(func() { _ = coll.Drop(ctx) })
+
+	// 4 docs all same (e,o1): collapsing deletes 3 of 4 = 75% > 50% => guarded.
+	var docs []interface{}
+	for i := 0; i < 4; i++ {
+		docs = append(docs, bson.M{"_id": fmt.Sprintf("d%d", i), "event_name": "e", "original_id": "o1", "retry_count": 1, "created_at": time.Now().UTC()})
+	}
+	_, _ = coll.InsertMany(ctx, docs)
+
+	if _, err := store.MigrateDedup(ctx); err == nil {
+		t.Fatal("expected guard error when >50% would be deleted")
+	}
+	if _, err := store.MigrateDedup(ctx, WithForce()); err != nil {
+		t.Fatalf("with force: %v", err)
+	}
+	if n, _ := store.Count(ctx, Filter{}); n != 1 {
+		t.Fatalf("after forced migrate want 1, got %d", n)
+	}
+}
+
+func TestMongoStoreQuarantine(t *testing.T) {
+	client := getMongoClient(t)
+	ctx := context.Background()
+
+	dbName := "dlq_quarantine_test_" + time.Now().Format("20060102150405")
+	db := client.Database(dbName)
+	t.Cleanup(func() {
+		db.Drop(context.Background())
+	})
+
+	store, err := NewMongoStore(db, WithCollection("dlq_quarantine_test"))
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	if err := store.EnsureIndexes(ctx); err != nil {
+		t.Fatalf("EnsureIndexes: %v", err)
+	}
+
+	now := time.Now()
+	msgs := []*Message{
+		{ID: "m1", EventName: "e", OriginalID: "o1", CreatedAt: now},
+		{ID: "m2", EventName: "e", OriginalID: "o2", CreatedAt: now},
+		{ID: "m3", EventName: "e", OriginalID: "o3", CreatedAt: now},
+	}
+	for _, m := range msgs {
+		if err := store.Store(ctx, m); err != nil {
+			t.Fatalf("store %s: %v", m.ID, err)
+		}
+	}
+
+	// Quarantine the message and verify QuarantinedAt is set.
+	if err := store.Quarantine(ctx, "m1"); err != nil {
+		t.Fatalf("quarantine: %v", err)
+	}
+	got, err := store.Get(ctx, "m1")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.QuarantinedAt == nil {
+		t.Fatal("expected QuarantinedAt set after Quarantine")
+	}
+
+	// ExcludeQuarantined must hide the quarantined message.
+	list, err := store.List(ctx, Filter{ExcludeQuarantined: true})
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	for _, m := range list {
+		if m.ID == "m1" {
+			t.Fatal("ExcludeQuarantined must hide quarantined message")
+		}
+	}
+
+	// Quarantining a missing ID must return an error.
+	if err := store.Quarantine(ctx, "missing"); err == nil {
+		t.Fatal("expected error quarantining missing message")
+	}
+
+	// Stats must reflect quarantined message: QuarantinedMessages=1, PendingMessages=2.
+	stats, err := store.Stats(ctx)
+	if err != nil {
+		t.Fatalf("stats: %v", err)
+	}
+	if stats.TotalMessages != 3 {
+		t.Errorf("Stats.TotalMessages: want 3, got %d", stats.TotalMessages)
+	}
+	if stats.QuarantinedMessages != 1 {
+		t.Errorf("Stats.QuarantinedMessages: want 1, got %d", stats.QuarantinedMessages)
+	}
+	if stats.PendingMessages != 2 {
+		t.Errorf("Stats.PendingMessages: want 2 (quarantined excluded), got %d", stats.PendingMessages)
+	}
+}
+
+func TestPostgresStoreDedup(t *testing.T) {
+	db := getPostgresDB(t)
+	ctx := context.Background()
+
+	// dedup OFF: two rows for same (event, original)
+	off, _ := NewPostgresStore(db, WithTable("dlq_pg_dedup_off"))
+	_, _ = db.ExecContext(ctx, "DROP TABLE IF EXISTS dlq_pg_dedup_off")
+	_ = off.EnsureTable(ctx)
+	t.Cleanup(func() { _, _ = db.ExecContext(ctx, "DROP TABLE IF EXISTS dlq_pg_dedup_off") })
+	_ = off.Store(ctx, &Message{ID: "a", EventName: "e", OriginalID: "o1", Payload: []byte{}, Error: "x", CreatedAt: time.Now()})
+	_ = off.Store(ctx, &Message{ID: "b", EventName: "e", OriginalID: "o1", Payload: []byte{}, Error: "x", CreatedAt: time.Now()})
+	if n, _ := off.Count(ctx, Filter{}); n != 2 {
+		t.Fatalf("dedup off: want 2, got %d", n)
+	}
+
+	// dedup ON with unique index (created by EnsureTable): upsert via ON CONFLICT
+	on, _ := NewPostgresStore(db, WithTable("dlq_pg_dedup_on"), WithPostgresDedup())
+	_, _ = db.ExecContext(ctx, "DROP TABLE IF EXISTS dlq_pg_dedup_on")
+	_ = on.EnsureTable(ctx)
+	t.Cleanup(func() { _, _ = db.ExecContext(ctx, "DROP TABLE IF EXISTS dlq_pg_dedup_on") })
+	first := time.Now().Add(-time.Hour)
+	_ = on.Store(ctx, &Message{ID: "a", EventName: "e", OriginalID: "o1", Payload: []byte{}, Error: "err1", RetryCount: 3, CreatedAt: first})
+	_ = on.Store(ctx, &Message{ID: "b", EventName: "e", OriginalID: "o1", Payload: []byte{}, Error: "err2", RetryCount: 0, CreatedAt: time.Now()})
+	if n, _ := on.Count(ctx, Filter{}); n != 1 {
+		t.Fatalf("dedup on: want 1, got %d", n)
+	}
+	g, _ := on.GetByOriginalID(ctx, "o1")
+	if g.RetryCount != 4 {
+		t.Fatalf("retry_count: want 4, got %d", g.RetryCount)
+	}
+	if g.Error != "err2" {
+		t.Fatalf("error latest: want err2, got %q", g.Error)
+	}
+
+	// dedup ON but NO unique constraint (drop it) => fallback path still upserts
+	nc, _ := NewPostgresStore(db, WithTable("dlq_pg_dedup_noidx"), WithPostgresDedup())
+	_, _ = db.ExecContext(ctx, "DROP TABLE IF EXISTS dlq_pg_dedup_noidx")
+	_ = nc.EnsureTable(ctx)
+	_, _ = db.ExecContext(ctx, "DROP INDEX IF EXISTS uniq_dlq_pg_dedup_noidx_event_original")
+	t.Cleanup(func() { _, _ = db.ExecContext(ctx, "DROP TABLE IF EXISTS dlq_pg_dedup_noidx") })
+	_ = nc.Store(ctx, &Message{ID: "a", EventName: "e", OriginalID: "o9", Payload: []byte{}, Error: "f1", RetryCount: 1, CreatedAt: time.Now()})
+	if err := nc.Store(ctx, &Message{ID: "b", EventName: "e", OriginalID: "o9", Payload: []byte{}, Error: "f2", RetryCount: 0, CreatedAt: time.Now()}); err != nil {
+		t.Fatalf("fallback upsert must not error without constraint: %v", err)
+	}
+	if n, _ := nc.Count(ctx, Filter{}); n != 1 {
+		t.Fatalf("fallback dedup: want 1 row, got %d", n)
+	}
+	g2, _ := nc.GetByOriginalID(ctx, "o9")
+	if g2.RetryCount != 2 {
+		t.Fatalf("fallback retry_count: want 2, got %d", g2.RetryCount)
+	}
+}
+
+func TestPostgresStoreMigrateDedup(t *testing.T) {
+	db := getPostgresDB(t)
+	ctx := context.Background()
+	store, _ := NewPostgresStore(db, WithTable("dlq_pg_migrate"), WithPostgresDedup())
+	_, _ = db.ExecContext(ctx, "DROP TABLE IF EXISTS dlq_pg_migrate")
+	_ = store.EnsureTable(ctx)
+	// Drop the unique index so we can seed duplicates directly.
+	_, _ = db.ExecContext(ctx, "DROP INDEX IF EXISTS uniq_dlq_pg_migrate_event_original")
+	t.Cleanup(func() { _, _ = db.ExecContext(ctx, "DROP TABLE IF EXISTS dlq_pg_migrate") })
+
+	old := time.Now().Add(-2 * time.Hour)
+	mid := time.Now().Add(-time.Hour)
+	newest := time.Now()
+	seed := func(id string, rc int, ts time.Time) {
+		_, err := db.ExecContext(ctx,
+			"INSERT INTO dlq_pg_migrate (id,event_name,original_id,payload,metadata,error,retry_count,source,created_at) VALUES ($1,'e','o1',$2,'{}','x',$3,'s',$4)",
+			id, []byte{}, rc, ts)
+		if err != nil {
+			t.Fatalf("seed %s: %v", id, err)
+		}
+	}
+	seed("d1", 1, mid)
+	seed("d2", 2, old)
+	seed("d3", 3, newest)
+	// one unique (e,o2)
+	_, _ = db.ExecContext(ctx, "INSERT INTO dlq_pg_migrate (id,event_name,original_id,payload,metadata,error,retry_count,source,created_at) VALUES ('u1','e','o2',$1,'{}','x',5,'s',$2)", []byte{}, newest)
+
+	// 2 of 4 deleted = 50%, allowed without force
+	removed, err := store.MigrateDedup(ctx)
+	if err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	if removed != 2 {
+		t.Fatalf("want 2 removed, got %d", removed)
+	}
+	g, err := store.GetByOriginalID(ctx, "o1")
+	if err != nil {
+		t.Fatalf("survivor: %v", err)
+	}
+	if g.ID != "d3" {
+		t.Fatalf("want newest d3 kept, got %s", g.ID)
+	}
+	if g.RetryCount != 6 {
+		t.Fatalf("want summed retry_count 6, got %d", g.RetryCount)
+	}
+	if n, _ := store.Count(ctx, Filter{}); n != 2 {
+		t.Fatalf("want 2 rows total, got %d", n)
+	}
+	// Unique index now present: a raw duplicate insert must fail.
+	_, err = db.ExecContext(ctx, "INSERT INTO dlq_pg_migrate (id,event_name,original_id,payload,metadata,error,retry_count,source,created_at) VALUES ('dup','e','o1',$1,'{}','x',0,'s',$2)", []byte{}, newest)
+	if err == nil {
+		t.Fatal("expected duplicate-key violation after unique index created")
+	}
+}
+
+func TestPostgresStoreMigrateDedup_ForceGuard(t *testing.T) {
+	db := getPostgresDB(t)
+	ctx := context.Background()
+	store, _ := NewPostgresStore(db, WithTable("dlq_pg_migrate_guard"), WithPostgresDedup())
+	_, _ = db.ExecContext(ctx, "DROP TABLE IF EXISTS dlq_pg_migrate_guard")
+	_ = store.EnsureTable(ctx)
+	_, _ = db.ExecContext(ctx, "DROP INDEX IF EXISTS uniq_dlq_pg_migrate_guard_event_original")
+	t.Cleanup(func() { _, _ = db.ExecContext(ctx, "DROP TABLE IF EXISTS dlq_pg_migrate_guard") })
+
+	for i := 0; i < 4; i++ {
+		_, err := db.ExecContext(ctx,
+			"INSERT INTO dlq_pg_migrate_guard (id,event_name,original_id,payload,metadata,error,retry_count,source,created_at) VALUES ($1,'e','o1',$2,'{}','x',1,'s',$3)",
+			fmt.Sprintf("d%d", i), []byte{}, time.Now())
+		if err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+	}
+	if _, err := store.MigrateDedup(ctx); err == nil {
+		t.Fatal("expected guard error at >50% deletion")
+	}
+	if _, err := store.MigrateDedup(ctx, WithForce()); err != nil {
+		t.Fatalf("force: %v", err)
+	}
+	if n, _ := store.Count(ctx, Filter{}); n != 1 {
+		t.Fatalf("after force want 1, got %d", n)
+	}
+}
+
+func TestPostgresStoreQuarantine(t *testing.T) {
+	db := getPostgresDB(t)
+	ctx := context.Background()
+	store, err := NewPostgresStore(db, WithTable("dlq_pg_quarantine_test"))
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	_, _ = db.ExecContext(ctx, "DROP TABLE IF EXISTS dlq_pg_quarantine_test")
+	if err := store.EnsureTable(ctx); err != nil {
+		t.Fatalf("ensure table: %v", err)
+	}
+	t.Cleanup(func() { _, _ = db.ExecContext(ctx, "DROP TABLE IF EXISTS dlq_pg_quarantine_test") })
+
+	now := time.Now()
+	if err := store.Store(ctx, &Message{ID: "m1", EventName: "e", OriginalID: "o1", Payload: []byte("{}"), Error: "x", CreatedAt: now}); err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	if err := store.Quarantine(ctx, "m1"); err != nil {
+		t.Fatalf("quarantine: %v", err)
+	}
+	got, err := store.Get(ctx, "m1")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.QuarantinedAt == nil {
+		t.Fatal("expected QuarantinedAt set")
+	}
+	list, _ := store.List(ctx, Filter{ExcludeQuarantined: true})
+	for _, m := range list {
+		if m.ID == "m1" {
+			t.Fatal("ExcludeQuarantined must hide quarantined message")
+		}
+	}
+	if err := store.Quarantine(ctx, "missing"); err == nil {
+		t.Fatal("expected error quarantining missing id")
+	}
+
+	// Long original_id (former VARCHAR(36) would have rejected this ~140-char value)
+	longID := "826A100506000000112B042C0100296E5A100475D36D2326024308B40C3D05BFEF1AE7463C6F7065726174696F6E54797065003C7570646174650046646F63756D656E744B6579"
+	if err := store.Store(ctx, &Message{ID: "m2", EventName: "e", OriginalID: longID, Payload: []byte("{}"), Error: "x", CreatedAt: now}); err != nil {
+		t.Fatalf("store long original_id (TEXT widen): %v", err)
+	}
+
+	// Stats must reflect the quarantined message.
+	stats, err := store.Stats(ctx)
+	if err != nil {
+		t.Fatalf("stats: %v", err)
+	}
+	if stats.QuarantinedMessages != 1 {
+		t.Errorf("Stats.QuarantinedMessages: want 1, got %d", stats.QuarantinedMessages)
+	}
+	// m1 is quarantined, m2 is pending → PendingMessages == 1.
+	if stats.PendingMessages != 1 {
+		t.Errorf("Stats.PendingMessages: want 1 (quarantined excluded), got %d", stats.PendingMessages)
+	}
 }

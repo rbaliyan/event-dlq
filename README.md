@@ -252,12 +252,13 @@ store := dlq.NewRedisStore(client).
 | Field | Description |
 |-------|-------------|
 | `EventName` | Filter by event name (exact match) |
-| `StartTime` | Filter messages created after this time |
-| `EndTime` | Filter messages created before this time |
+| `After` | Filter messages created after this time |
+| `Before` | Filter messages created before this time |
 | `Error` | Filter by error message (contains match) |
 | `MaxRetries` | Filter by maximum retry count |
 | `Source` | Filter by source service |
 | `ExcludeRetried` | Exclude already replayed messages |
+| `ExcludeQuarantined` | Exclude quarantined (terminal) messages |
 | `Limit` | Maximum number of results |
 | `Offset` | Pagination offset |
 
@@ -265,18 +266,112 @@ store := dlq.NewRedisStore(client).
 
 ```go
 type Message struct {
-    ID         string            // Unique DLQ message ID
-    EventName  string            // Original event name
-    OriginalID string            // Original message ID
-    Payload    []byte            // Message payload
-    Metadata   map[string]string // Message metadata
-    Error      string            // Error description
-    RetryCount int               // Retries attempted
-    CreatedAt  time.Time         // When added to DLQ
-    RetriedAt  *time.Time        // When replayed (nil if never)
-    Source     string            // Source service
+    ID             string            // Unique DLQ message ID
+    EventName      string            // Original event name
+    OriginalID     string            // Original message ID
+    Payload        []byte            // Message payload
+    Metadata       map[string]string // Message metadata
+    Error          string            // Error description
+    RetryCount     int               // Retries attempted
+    CreatedAt      time.Time         // When added to DLQ
+    RetriedAt      *time.Time        // When replayed (nil if never)
+    QuarantinedAt  *time.Time        // When classified as terminal (nil if not quarantined)
+    Source         string            // Source service
 }
 ```
+
+## Preventing replay loops (terminal-error quarantine)
+
+Some messages will never succeed regardless of how many times they are replayed — for example, messages whose payload cannot be decoded against the current schema, or whose downstream dependency has been permanently removed. Replaying them forever wastes resources and can destabilise consumers.
+
+`WithTerminalError` adds a predicate to the Manager. During `Replay` and `ReplaySingle`, any message for which the predicate returns true is **quarantined** instead of republished: its `QuarantinedAt` timestamp is set and it is excluded from every future sweep automatically.
+
+```go
+manager, err := dlq.NewManager(store, bus,
+    // Quarantine messages whose error contains either substring.
+    dlq.WithTerminalError(dlq.TerminalErrorMatching(
+        "proto: cannot parse",
+        "unknown field",
+    )),
+)
+if err != nil {
+    log.Fatal(err)
+}
+```
+
+`TerminalErrorMatching` is a convenience helper that performs a case-sensitive substring match against `Message.Error`. An empty error never matches. You can supply any `func(*dlq.Message) bool` for more complex logic:
+
+```go
+dlq.WithTerminalError(func(msg *dlq.Message) bool {
+    return strings.HasPrefix(msg.Error, "SCHEMA_INCOMPATIBLE:")
+})
+```
+
+**Behaviour at a glance:**
+- Default is `nil` — when unset, `Replay` behaves exactly as before (every message is replayed).
+- Quarantine requires the store to implement the optional `Quarantiner` interface (all four built-in stores do). If the store does not implement `Quarantiner`, the message is skipped with a warning instead of being republished.
+- `Replay` always sets `Filter.ExcludeQuarantined = true` internally, so quarantined messages are never re-evaluated on subsequent sweeps.
+- `Stats.QuarantinedMessages` counts quarantined messages; `Stats.PendingMessages` excludes them.
+- The OTel counter `dlq_messages_quarantined_total{event}` increments on each quarantine.
+
+### Stopping an active poison-replay loop (operational runbook)
+
+If a deployment is already caught in a replay loop before quarantine is configured:
+
+1. **Disable the scheduled Replay job** to stop further republishing.
+2. **Identify and purge the poison rows** — use `DeleteByFilter` or a direct query filtered by the known error pattern.
+3. **Fix the upstream decode/schema error** that caused the permanent failures.
+4. Re-deploy with `WithTerminalError` wired into the Manager.
+5. **Re-enable the Replay job**.
+
+## Optional deduplication
+
+By default each `Store` call inserts a distinct row, so multiple failures of the same original message each occupy their own DLQ entry. This is correct for most workloads where every failure is independent.
+
+When a consumer can re-DLQ the same logical message multiple times (e.g., at-least-once delivery with an unhealthy consumer), opt-in deduplication collapses those entries into a single row. Enable it per store:
+
+```go
+// Memory (testing)
+store := dlq.NewMemoryStore(dlq.WithMemoryDedup())
+
+// PostgreSQL
+store, err := dlq.NewPostgresStore(db, dlq.WithPostgresDedup())
+
+// MongoDB
+store, err := dlq.NewMongoStore(db, dlq.WithMongoDedup())
+
+// Redis
+store, err := dlq.NewRedisStore(client, dlq.WithRedisDedup())
+```
+
+When dedup is enabled, re-storing a message with the same non-empty `(EventName, OriginalID)` pair **upserts**: it increments `retry_count`, updates the error/payload/metadata to the latest values, preserves `created_at` (first-seen timestamp), and clears `retried_at`. Messages with an empty `OriginalID` always insert as distinct rows.
+
+A unique index on `(event_name, original_id)` is created automatically when dedup is enabled. For Mongo this happens in `EnsureIndexes`; for Postgres in `EnsureTable`. Index creation is failure-tolerant — if legacy duplicates are present the index creation is skipped with a warning (see `MigrateDedup` below).
+
+**Semantic shift when dedup is enabled:** `retry_count` becomes a re-DLQ recurrence counter rather than a count of retries before DLQ. The first insert keeps the caller-supplied value; subsequent re-stores increment it. This change applies only when dedup is enabled; the default (dedup off) is unchanged.
+
+### Migrating an existing table or collection
+
+If you enable dedup on a store that already contains duplicate `(event_name, original_id)` rows, index creation will fail silently. Run `MigrateDedup` once before — or immediately after — enabling the option:
+
+```go
+// Run once during deployment / migration
+removed, err := store.MigrateDedup(ctx)
+if err != nil {
+    log.Fatal("dedup migration failed", err)
+}
+log.Printf("collapsed %d duplicate DLQ entries", removed)
+```
+
+`MigrateDedup` collapses each duplicate group: it keeps the newest row, sums `retry_count`, preserves the oldest `created_at`, and OR-s the quarantine flag. It then creates the unique index.
+
+As a safety guard it refuses to delete more than 50 % of all rows unless `WithForce` is passed:
+
+```go
+removed, err := store.MigrateDedup(ctx, dlq.WithForce())
+```
+
+`MigrateDedup` is idempotent — a second call on an already-clean store is a no-op. Postgres uses `CREATE UNIQUE INDEX CONCURRENTLY` so the migration can run without locking the table.
 
 ## Best Practices
 
@@ -285,6 +380,8 @@ type Message struct {
 3. **Monitor DLQ size**: Set up alerts when DLQ grows unexpectedly
 4. **Regular cleanup**: Schedule periodic cleanup of old messages
 5. **Automated replay**: Consider automated replay for recoverable errors after fixes are deployed
+6. **Use terminal-error quarantine**: Wire `WithTerminalError` to prevent poison messages from blocking replay sweeps indefinitely
+7. **Enable dedup for recurring failures**: Use `With*Dedup()` when the same original message may re-enter the DLQ multiple times; run `MigrateDedup` on any pre-existing table first
 
 ## Examples
 

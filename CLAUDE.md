@@ -48,40 +48,43 @@ Dead Letter Queue (DLQ) package for the `github.com/rbaliyan/event` event pub-su
 ```go
 // Message in the DLQ
 type Message struct {
-    ID         string            // DLQ message ID (generated)
-    EventName  string            // Original event name
-    OriginalID string            // Original message ID
-    Payload    []byte            // Message payload
-    Metadata   map[string]string // Message metadata
-    Error      string            // Failure error
-    RetryCount int               // Retries attempted
-    CreatedAt  time.Time         // When added to DLQ
-    RetriedAt  *time.Time        // When replayed (nil if never)
-    Source     string            // Source service
+    ID             string            // DLQ message ID (generated)
+    EventName      string            // Original event name
+    OriginalID     string            // Original message ID
+    Payload        []byte            // Message payload
+    Metadata       map[string]string // Message metadata
+    Error          string            // Failure error
+    RetryCount     int               // Retries attempted (or re-DLQ count when dedup enabled)
+    CreatedAt      time.Time         // When added to DLQ (first-seen when dedup enabled)
+    RetriedAt      *time.Time        // When replayed (nil if never)
+    QuarantinedAt  *time.Time        // When Replay classified as terminal (nil if not quarantined)
+    Source         string            // Source service
 }
 
 // Filter for querying messages
 type Filter struct {
-    EventName      string
-    After          time.Time // messages received after this time
-    Before         time.Time // messages received before this time
-    Error          string    // Contains match
-    MaxRetries     int
-    Source         string
-    ExcludeRetried bool
-    Limit          int
-    Offset         int
+    EventName          string
+    After              time.Time // messages received after this time
+    Before             time.Time // messages received before this time
+    Error              string    // Contains match
+    MaxRetries         int
+    Source             string
+    ExcludeRetried     bool
+    ExcludeQuarantined bool      // Exclude terminal/quarantined messages
+    Limit              int
+    Offset             int
 }
 
 // Statistics
 type Stats struct {
-    TotalMessages   int64
-    PendingMessages int64
-    RetriedMessages int64
-    MessagesByEvent map[string]int64
-    MessagesByError map[string]int64
-    OldestMessage   *time.Time
-    NewestMessage   *time.Time
+    TotalMessages       int64
+    PendingMessages     int64            // Excludes quarantined messages
+    RetriedMessages     int64
+    QuarantinedMessages int64            // Messages quarantined as terminal
+    MessagesByEvent     map[string]int64
+    MessagesByError     map[string]int64
+    OldestMessage       *time.Time
+    NewestMessage       *time.Time
 }
 ```
 
@@ -90,6 +93,8 @@ type Stats struct {
 **Interface-Based Extensibility**: `Store` interface allows custom implementations
 
 **Optional Interface**: `StatsProvider` for stores that support detailed statistics
+
+**Optional Interface**: `Quarantiner` for stores that support terminal-message quarantine — `Quarantine(ctx, id) error`; detected via type assertion (same pattern as `StatsProvider`); all four built-in stores implement it
 
 **Builder Pattern**: Store constructors return self for method chaining:
 ```go
@@ -101,6 +106,12 @@ store := dlq.NewMongoStore(db).
 - `dlq_replay`: "true"
 - `dlq_message_id`: DLQ ID
 - `dlq_original_error`: original failure
+
+**Terminal-error quarantine**: `WithTerminalError(func(*Message) bool) ManagerOption` — default nil (no behaviour change). When set, `Replay`/`ReplaySingle` quarantine matching messages instead of republishing them. `TerminalErrorMatching(patterns ...string)` is a helper that does case-sensitive substring match on `Message.Error` (empty error never matches). `Replay` always forces `Filter{ExcludeQuarantined:true}` internally.
+
+**Opt-in deduplication**: OFF by default — every `Store` call inserts a distinct row. Enable per backend: `WithMemoryDedup()`, `WithMongoDedup()`, `WithPostgresDedup()`, `WithRedisDedup()`. When enabled, re-storing a message with the same non-empty `(EventName, OriginalID)` upserts: increments `retry_count`, updates error/payload/metadata, preserves `created_at`, clears `retried_at`. Empty `OriginalID` always inserts distinct.
+
+**MigrateDedup**: `MigrateDedup(ctx, ...MigrateDedupOption) (int64, error)` on Mongo/Postgres/Redis stores. Collapses existing duplicates (keeps newest, sums retry_count, keeps oldest created_at, OR-s quarantine), then creates the unique index. Refuses to delete >50% of rows unless `WithForce()` is passed. Run before enabling dedup on a table/collection that already has data.
 
 ## Dependencies
 

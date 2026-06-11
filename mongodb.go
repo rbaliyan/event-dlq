@@ -674,18 +674,26 @@ func (s *MongoStore) Stats(ctx context.Context) (*Stats, error) {
 	}
 	stats.TotalMessages = total
 
-	// Pending count (not retried). Exact and index-backed: the non-sparse retried_at
-	// index serves this equality-on-null predicate via a COUNT_SCAN.
-	pending, err := s.collection.CountDocuments(ctx, bson.M{"retried_at": nil})
+	// Pending count: not retried AND not quarantined. Exact and index-backed.
+	pending, err := s.collection.CountDocuments(ctx, bson.M{"retried_at": nil, "quarantined_at": nil})
 	if err != nil {
 		return nil, fmt.Errorf("count pending: %w", err)
 	}
 	stats.PendingMessages = pending
-	// total is an estimate while pending is exact, so the subtraction can briefly go
-	// negative around concurrent writes; clamp to keep the reported figure sane.
-	if retried := total - pending; retried > 0 {
-		stats.RetriedMessages = retried
+
+	// Quarantined count: messages marked as terminal (non-retryable).
+	quarantined, err := s.collection.CountDocuments(ctx, bson.M{"quarantined_at": bson.M{"$ne": nil}})
+	if err != nil {
+		return nil, fmt.Errorf("count quarantined: %w", err)
 	}
+	stats.QuarantinedMessages = quarantined
+
+	// Retried count: messages that have been replayed.
+	retried, err := s.collection.CountDocuments(ctx, bson.M{"retried_at": bson.M{"$ne": nil}})
+	if err != nil {
+		return nil, fmt.Errorf("count retried: %w", err)
+	}
+	stats.RetriedMessages = retried
 
 	// Count by event using aggregation
 	eventPipeline := mongo.Pipeline{

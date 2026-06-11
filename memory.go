@@ -307,7 +307,13 @@ func (s *MemoryStore) Stats(ctx context.Context) (*Stats, error) {
 
 		if msg.RetriedAt != nil {
 			stats.RetriedMessages++
-		} else {
+		}
+
+		if msg.QuarantinedAt != nil {
+			stats.QuarantinedMessages++
+		}
+
+		if msg.RetriedAt == nil && msg.QuarantinedAt == nil {
 			stats.PendingMessages++
 		}
 

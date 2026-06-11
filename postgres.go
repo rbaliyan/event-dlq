@@ -129,16 +129,25 @@ func (s *PostgresStore) EnsureTable(ctx context.Context) error {
 		return fmt.Errorf("create table: %w", err)
 	}
 
-	// Idempotent schema upgrades for pre-existing tables.
-	// #nosec G201 -- table name is set at construction, not user input
-	alters := []string{
-		fmt.Sprintf("ALTER TABLE %s ALTER COLUMN original_id TYPE TEXT", s.table),
-		fmt.Sprintf("ALTER TABLE %s ADD COLUMN IF NOT EXISTS quarantined_at TIMESTAMP", s.table),
-	}
-	for _, a := range alters {
-		if _, err := s.db.ExecContext(ctx, a); err != nil {
-			return fmt.Errorf("alter table: %w", err)
+	// Guard the original_id widening: only ALTER when the column is not already TEXT.
+	// Running ALTER COLUMN TYPE unconditionally acquires an ACCESS EXCLUSIVE lock on
+	// every call even when the type is already correct; checking first avoids the lock
+	// on steady-state deployments.
+	var dataType string
+	_ = s.db.QueryRowContext(ctx,
+		"SELECT data_type FROM information_schema.columns WHERE table_name=$1 AND column_name='original_id'",
+		s.table).Scan(&dataType)
+	if dataType != "" && dataType != "text" {
+		// #nosec G201 -- table name is set at construction, not user input
+		if _, err := s.db.ExecContext(ctx, fmt.Sprintf("ALTER TABLE %s ALTER COLUMN original_id TYPE TEXT", s.table)); err != nil {
+			return fmt.Errorf("alter original_id type: %w", err)
 		}
+	}
+
+	// Add quarantined_at column if not present (IF NOT EXISTS is cheap and idempotent).
+	// #nosec G201 -- table name is set at construction, not user input
+	if _, err := s.db.ExecContext(ctx, fmt.Sprintf("ALTER TABLE %s ADD COLUMN IF NOT EXISTS quarantined_at TIMESTAMP", s.table)); err != nil {
+		return fmt.Errorf("alter table: %w", err)
 	}
 
 	// #nosec G201 -- table name is set at construction, not user input
@@ -523,18 +532,32 @@ func (s *PostgresStore) Stats(ctx context.Context) (*Stats, error) {
 	}
 
 	// Total count
+	// #nosec G201 -- table name is set at construction, not user input
 	err := s.db.QueryRowContext(ctx, fmt.Sprintf("SELECT COUNT(*) FROM %s", s.table)).Scan(&stats.TotalMessages)
 	if err != nil {
 		return nil, fmt.Errorf("count total: %w", err)
 	}
 
-	// Pending count
-	err = s.db.QueryRowContext(ctx, fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE retried_at IS NULL", s.table)).Scan(&stats.PendingMessages)
+	// Pending count: not retried AND not quarantined.
+	// #nosec G201 -- table name is set at construction, not user input
+	err = s.db.QueryRowContext(ctx, fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE retried_at IS NULL AND quarantined_at IS NULL", s.table)).Scan(&stats.PendingMessages)
 	if err != nil {
 		return nil, fmt.Errorf("count pending: %w", err)
 	}
 
-	stats.RetriedMessages = stats.TotalMessages - stats.PendingMessages
+	// Retried count: messages that have been replayed.
+	// #nosec G201 -- table name is set at construction, not user input
+	err = s.db.QueryRowContext(ctx, fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE retried_at IS NOT NULL", s.table)).Scan(&stats.RetriedMessages)
+	if err != nil {
+		return nil, fmt.Errorf("count retried: %w", err)
+	}
+
+	// Quarantined count: messages marked as terminal.
+	// #nosec G201 -- table name is set at construction, not user input
+	err = s.db.QueryRowContext(ctx, fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE quarantined_at IS NOT NULL", s.table)).Scan(&stats.QuarantinedMessages)
+	if err != nil {
+		return nil, fmt.Errorf("count quarantined: %w", err)
+	}
 
 	// Messages by event
 	rows, err := s.db.QueryContext(ctx, fmt.Sprintf("SELECT event_name, COUNT(*) FROM %s GROUP BY event_name", s.table))

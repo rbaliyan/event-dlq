@@ -471,8 +471,33 @@ func TestRedisStore_Stats(t *testing.T) {
 	assert.Equal(t, int64(3), stats.TotalMessages)
 	assert.Equal(t, int64(1), stats.RetriedMessages)
 	assert.Equal(t, int64(2), stats.PendingMessages)
+	assert.Equal(t, int64(0), stats.QuarantinedMessages)
 	assert.Equal(t, int64(2), stats.MessagesByEvent["order.created"])
 	assert.Equal(t, int64(1), stats.MessagesByEvent["order.updated"])
+}
+
+func TestRedisStore_Stats_Quarantine(t *testing.T) {
+	store, _ := setupRedisStore(t)
+	ctx := context.Background()
+
+	msgs := []*Message{
+		{ID: "sq-1", EventName: "order.created", Payload: []byte("p"), Error: "e", CreatedAt: time.Now()},
+		{ID: "sq-2", EventName: "order.created", Payload: []byte("p"), Error: "e", CreatedAt: time.Now()},
+		{ID: "sq-3", EventName: "order.created", Payload: []byte("p"), Error: "e", CreatedAt: time.Now()},
+	}
+	for _, m := range msgs {
+		require.NoError(t, store.Store(ctx, m))
+	}
+
+	// Quarantine one message; the pending count must drop by one.
+	require.NoError(t, store.Quarantine(ctx, "sq-1"))
+
+	stats, err := store.Stats(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, int64(3), stats.TotalMessages)
+	assert.Equal(t, int64(0), stats.RetriedMessages)
+	assert.Equal(t, int64(1), stats.QuarantinedMessages)
+	assert.Equal(t, int64(2), stats.PendingMessages)
 }
 
 func TestRedisStore_Quarantine(t *testing.T) {

@@ -447,8 +447,15 @@ func TestMongoStoreQuarantine(t *testing.T) {
 	}
 
 	now := time.Now()
-	if err := store.Store(ctx, &Message{ID: "m1", EventName: "e", OriginalID: "o1", CreatedAt: now}); err != nil {
-		t.Fatalf("store: %v", err)
+	msgs := []*Message{
+		{ID: "m1", EventName: "e", OriginalID: "o1", CreatedAt: now},
+		{ID: "m2", EventName: "e", OriginalID: "o2", CreatedAt: now},
+		{ID: "m3", EventName: "e", OriginalID: "o3", CreatedAt: now},
+	}
+	for _, m := range msgs {
+		if err := store.Store(ctx, m); err != nil {
+			t.Fatalf("store %s: %v", m.ID, err)
+		}
 	}
 
 	// Quarantine the message and verify QuarantinedAt is set.
@@ -477,6 +484,21 @@ func TestMongoStoreQuarantine(t *testing.T) {
 	// Quarantining a missing ID must return an error.
 	if err := store.Quarantine(ctx, "missing"); err == nil {
 		t.Fatal("expected error quarantining missing message")
+	}
+
+	// Stats must reflect quarantined message: QuarantinedMessages=1, PendingMessages=2.
+	stats, err := store.Stats(ctx)
+	if err != nil {
+		t.Fatalf("stats: %v", err)
+	}
+	if stats.TotalMessages != 3 {
+		t.Errorf("Stats.TotalMessages: want 3, got %d", stats.TotalMessages)
+	}
+	if stats.QuarantinedMessages != 1 {
+		t.Errorf("Stats.QuarantinedMessages: want 1, got %d", stats.QuarantinedMessages)
+	}
+	if stats.PendingMessages != 2 {
+		t.Errorf("Stats.PendingMessages: want 2 (quarantined excluded), got %d", stats.PendingMessages)
 	}
 }
 
@@ -657,5 +679,18 @@ func TestPostgresStoreQuarantine(t *testing.T) {
 	longID := "826A100506000000112B042C0100296E5A100475D36D2326024308B40C3D05BFEF1AE7463C6F7065726174696F6E54797065003C7570646174650046646F63756D656E744B6579"
 	if err := store.Store(ctx, &Message{ID: "m2", EventName: "e", OriginalID: longID, Payload: []byte("{}"), Error: "x", CreatedAt: now}); err != nil {
 		t.Fatalf("store long original_id (TEXT widen): %v", err)
+	}
+
+	// Stats must reflect the quarantined message.
+	stats, err := store.Stats(ctx)
+	if err != nil {
+		t.Fatalf("stats: %v", err)
+	}
+	if stats.QuarantinedMessages != 1 {
+		t.Errorf("Stats.QuarantinedMessages: want 1, got %d", stats.QuarantinedMessages)
+	}
+	// m1 is quarantined, m2 is pending → PendingMessages == 1.
+	if stats.PendingMessages != 1 {
+		t.Errorf("Stats.PendingMessages: want 1 (quarantined excluded), got %d", stats.PendingMessages)
 	}
 }

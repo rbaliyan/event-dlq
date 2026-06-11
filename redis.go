@@ -677,7 +677,18 @@ func (s *RedisStore) Stats(ctx context.Context) (*Stats, error) {
 
 	retried, _ := s.client.SCard(ctx, s.retriedKey).Result()
 	stats.RetriedMessages = retried
-	stats.PendingMessages = total - retried
+
+	quarantined, _ := s.client.SCard(ctx, s.quarantinedKey).Result()
+	stats.QuarantinedMessages = quarantined
+
+	// Pending = total - |retried ∪ quarantined|: a message is pending iff it is
+	// neither retried nor quarantined. Computing the union cardinality avoids
+	// double-counting messages that are in both sets.
+	unionMembers, _ := s.client.SUnion(ctx, s.retriedKey, s.quarantinedKey).Result()
+	nonPending := int64(len(unionMembers))
+	if pending := total - nonPending; pending > 0 {
+		stats.PendingMessages = pending
+	}
 
 	// Enumerate event names via SCAN; ZCard each event sorted set.
 	var cursor uint64

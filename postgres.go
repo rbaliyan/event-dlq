@@ -215,7 +215,7 @@ func (s *PostgresStore) Store(ctx context.Context, msg *Message) error {
 		msg.Error,
 		msg.RetryCount,
 		msg.Source,
-		msg.CreatedAt,
+		msg.CreatedAt.UTC(),
 	)
 
 	if err != nil {
@@ -245,7 +245,7 @@ func (s *PostgresStore) storeDedup(ctx context.Context, msg *Message, metadata [
 
 	_, err := s.db.ExecContext(ctx, upsert,
 		msg.ID, msg.EventName, msg.OriginalID, msg.Payload, metadata,
-		msg.Error, msg.RetryCount, msg.Source, msg.CreatedAt)
+		msg.Error, msg.RetryCount, msg.Source, msg.CreatedAt.UTC())
 	if err == nil {
 		return nil
 	}
@@ -274,7 +274,7 @@ func (s *PostgresStore) storeDedupFallback(ctx context.Context, msg *Message, me
 		ins := fmt.Sprintf(`INSERT INTO %s (id, event_name, original_id, payload, metadata, error, retry_count, source, created_at)
 			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`, s.table)
 		if _, err = tx.ExecContext(ctx, ins, msg.ID, msg.EventName, msg.OriginalID, msg.Payload,
-			metadata, msg.Error, msg.RetryCount, msg.Source, msg.CreatedAt); err != nil {
+			metadata, msg.Error, msg.RetryCount, msg.Source, msg.CreatedAt.UTC()); err != nil {
 			return fmt.Errorf("fallback insert: %w", err)
 		}
 	case err != nil:
@@ -401,8 +401,8 @@ func (s *PostgresStore) buildFilterClauses(filter Filter) *base.QueryBuilder {
 	qb := base.NewQueryBuilder()
 
 	qb.AddIfNotEmpty("event_name = $%d", filter.EventName)
-	qb.AddIfNotZero("created_at >= $%d", filter.After)
-	qb.AddIfNotZero("created_at <= $%d", filter.Before)
+	qb.AddIfNotZero("created_at >= $%d", filter.After.UTC())
+	qb.AddIfNotZero("created_at <= $%d", filter.Before.UTC())
 	if filter.Error != "" {
 		qb.Add("error ILIKE $%d", "%"+filter.Error+"%")
 	}
@@ -431,7 +431,7 @@ func (s *PostgresStore) buildListQuery(filter Filter, countOnly bool) (string, [
 
 	baseQuery, args := qb.Build(query)
 
-	if filter.Limit > 0 {
+	if filter.Limit > 0 || filter.Offset > 0 {
 		limitClause := qb.AppendLimit(filter.Limit, filter.Offset)
 		baseQuery += limitClause
 		args = qb.Args()
@@ -449,7 +449,7 @@ func (s *PostgresStore) MarkRetried(ctx context.Context, id string) error {
 		WHERE id = $2
 	`, s.table)
 
-	result, err := s.db.ExecContext(ctx, query, time.Now(), id)
+	result, err := s.db.ExecContext(ctx, query, time.Now().UTC(), id)
 	if err != nil {
 		return fmt.Errorf("update: %w", err)
 	}
@@ -466,7 +466,7 @@ func (s *PostgresStore) MarkRetried(ctx context.Context, id string) error {
 // #nosec G201 -- table name is set at construction, not user input
 func (s *PostgresStore) Quarantine(ctx context.Context, id string) error {
 	q := fmt.Sprintf("UPDATE %s SET quarantined_at = $1 WHERE id = $2", s.table)
-	res, err := s.db.ExecContext(ctx, q, time.Now(), id)
+	res, err := s.db.ExecContext(ctx, q, time.Now().UTC(), id)
 	if err != nil {
 		return fmt.Errorf("quarantine: %w", err)
 	}
@@ -496,7 +496,7 @@ func (s *PostgresStore) Delete(ctx context.Context, id string) error {
 // DeleteOlderThan removes messages older than the specified age
 func (s *PostgresStore) DeleteOlderThan(ctx context.Context, age time.Duration) (int64, error) {
 	query := fmt.Sprintf("DELETE FROM %s WHERE created_at < $1", s.table) // #nosec G201 -- table name is set at construction, not user input
-	result, err := s.db.ExecContext(ctx, query, time.Now().Add(-age))
+	result, err := s.db.ExecContext(ctx, query, time.Now().Add(-age).UTC())
 	if err != nil {
 		return 0, fmt.Errorf("delete: %w", err)
 	}

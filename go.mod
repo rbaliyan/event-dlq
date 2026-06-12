@@ -9,7 +9,7 @@ require (
 	github.com/lib/pq v1.12.3
 	github.com/rbaliyan/event-mongodb v0.7.1
 	github.com/rbaliyan/event/v3 v3.17.4
-	github.com/redis/go-redis/v9 v9.20.0
+	github.com/redis/go-redis/v9 v9.20.1
 	github.com/stretchr/testify v1.11.1
 	go.mongodb.org/mongo-driver/v2 v2.6.0
 	go.opentelemetry.io/otel v1.44.0

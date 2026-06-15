@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 	"time"
 
@@ -69,13 +70,14 @@ func (r *transportRepublisher) Send(ctx context.Context, eventName string, event
 }
 
 type Manager struct {
-	store         Store
-	republisher   Republisher
-	logger        *slog.Logger
-	metrics       *Metrics
-	backoff       BackoffStrategy
-	maxRetries    int
-	terminalError func(*Message) bool
+	store             Store
+	republisher       Republisher
+	logger            *slog.Logger
+	metrics           *Metrics
+	backoff           BackoffStrategy
+	maxRetries        int
+	terminalError     func(*Message) bool
+	maxReplayAttempts int
 }
 
 // BackoffStrategy is an alias for backoff.Strategy from the main event library.
@@ -117,11 +119,12 @@ var _ Storer = (*Manager)(nil)
 
 // managerOptions holds configuration for Manager (unexported)
 type managerOptions struct {
-	logger        *slog.Logger
-	metrics       *Metrics
-	backoff       BackoffStrategy
-	maxRetries    int
-	terminalError func(*Message) bool
+	logger            *slog.Logger
+	metrics           *Metrics
+	backoff           BackoffStrategy
+	maxRetries        int
+	terminalError     func(*Message) bool
+	maxReplayAttempts int
 }
 
 // ManagerOption is a functional option for configuring Manager
@@ -230,6 +233,46 @@ func WithTerminalError(pred func(*Message) bool) ManagerOption {
 	}
 }
 
+// MetadataReplayCount is the message-metadata key tracking how many times a
+// message has been replayed. It rides in the published message's metadata and
+// survives the republish -> re-DLQ round trip, so it accumulates across replay
+// cycles even when each cycle produces a fresh DLQ row (no dedup required).
+const MetadataReplayCount = "dlq_replay_count"
+
+// WithMaxReplayAttempts caps how many times a single message may be replayed
+// before it is quarantined (stop replaying, keep the row for inspection),
+// regardless of why it fails. This is the error-agnostic backstop against a
+// permanently-failing message looping forever: republish -> decode/handler fails
+// -> re-DLQ -> republish ... The count is carried in message metadata
+// (MetadataReplayCount), so it bounds the loop without dedup or a stable row.
+//
+// n <= 0 (the default) means unlimited replays — the prior behavior. A small
+// value (e.g. 3-5) is recommended for any auto-replay loop.
+func WithMaxReplayAttempts(n int) ManagerOption {
+	return func(o *managerOptions) {
+		o.maxReplayAttempts = n
+	}
+}
+
+// replayCount returns how many times the message has already been replayed,
+// read from its metadata. Missing/invalid values count as 0.
+func replayCount(msg *Message) int {
+	if msg == nil || msg.Metadata == nil {
+		return 0
+	}
+	n, err := strconv.Atoi(msg.Metadata[MetadataReplayCount])
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
+}
+
+// exceededReplayCap reports whether the message has hit the configured
+// max-replay-attempts cap. Always false when the cap is disabled (n <= 0).
+func (m *Manager) exceededReplayCap(msg *Message) bool {
+	return m.maxReplayAttempts > 0 && replayCount(msg) >= m.maxReplayAttempts
+}
+
 // TerminalErrorMatching returns a predicate that reports a message as terminal
 // when its Error contains any of the given (case-sensitive) substrings. An
 // empty Error never matches.
@@ -293,13 +336,14 @@ func NewManager(store Store, r Republisher, opts ...ManagerOption) (*Manager, er
 	}
 
 	return &Manager{
-		store:         store,
-		republisher:   r,
-		logger:        o.logger,
-		metrics:       o.metrics,
-		backoff:       o.backoff,
-		maxRetries:    o.maxRetries,
-		terminalError: o.terminalError,
+		store:             store,
+		republisher:       r,
+		logger:            o.logger,
+		metrics:           o.metrics,
+		backoff:           o.backoff,
+		maxRetries:        o.maxRetries,
+		terminalError:     o.terminalError,
+		maxReplayAttempts: o.maxReplayAttempts,
 	}, nil
 }
 
@@ -427,18 +471,14 @@ func (m *Manager) Replay(ctx context.Context, filter Filter) (int, error) {
 	replayed := 0
 	warnedNoQuarantine := false
 	for _, msg := range messages {
+		// Generic, error-agnostic backstop: a message that has been replayed too
+		// many times is quarantined regardless of why it keeps failing.
+		if m.exceededReplayCap(msg) {
+			m.quarantineDuringReplay(ctx, msg, "max_replay_attempts", &warnedNoQuarantine)
+			continue
+		}
 		if m.isTerminal(msg) {
-			if err := m.quarantineTerminal(ctx, msg); err != nil {
-				if errors.Is(err, errStoreNotQuarantiner) {
-					if !warnedNoQuarantine {
-						m.logger.Warn("terminal DLQ message but store does not support quarantine; skipping replay",
-							"id", msg.ID, "event", msg.EventName)
-						warnedNoQuarantine = true
-					}
-				} else {
-					m.logger.Error("failed to quarantine terminal message", "id", msg.ID, "error", err)
-				}
-			}
+			m.quarantineDuringReplay(ctx, msg, "terminal_error", &warnedNoQuarantine)
 			continue
 		}
 
@@ -485,7 +525,7 @@ func (m *Manager) isTerminal(msg *Message) bool {
 // quarantineTerminal quarantines a terminal message. It returns
 // errStoreNotQuarantiner if the store does not implement Quarantiner, or the
 // underlying store error if the quarantine write fails.
-func (m *Manager) quarantineTerminal(ctx context.Context, msg *Message) error {
+func (m *Manager) quarantineMessage(ctx context.Context, msg *Message, reason string) error {
 	q, ok := m.store.(Quarantiner)
 	if !ok {
 		return errStoreNotQuarantiner
@@ -494,9 +534,26 @@ func (m *Manager) quarantineTerminal(ctx context.Context, msg *Message) error {
 		return fmt.Errorf("quarantine %s: %w", msg.ID, err)
 	}
 	m.metrics.RecordQuarantined(ctx, msg.EventName)
-	m.logger.Info("quarantined terminal DLQ message",
-		"id", msg.ID, "event", msg.EventName, "error", msg.Error)
+	m.logger.Info("quarantined DLQ message instead of replaying",
+		"id", msg.ID, "event", msg.EventName, "reason", reason, "error", msg.Error)
 	return nil
+}
+
+// quarantineDuringReplay quarantines msg for the given reason while a Replay
+// sweep is running, handling the store-not-quarantiner and error cases. The
+// warnedNoQuarantine pointer suppresses repeated warnings to once per sweep.
+func (m *Manager) quarantineDuringReplay(ctx context.Context, msg *Message, reason string, warnedNoQuarantine *bool) {
+	if err := m.quarantineMessage(ctx, msg, reason); err != nil {
+		if errors.Is(err, errStoreNotQuarantiner) {
+			if !*warnedNoQuarantine {
+				m.logger.Warn("DLQ message must be quarantined but store does not support quarantine; skipping replay",
+					"id", msg.ID, "event", msg.EventName, "reason", reason)
+				*warnedNoQuarantine = true
+			}
+		} else {
+			m.logger.Error("failed to quarantine DLQ message", "id", msg.ID, "reason", reason, "error", err)
+		}
+	}
 }
 
 // ReplaySingle replays a single DLQ message by ID.
@@ -509,8 +566,11 @@ func (m *Manager) ReplaySingle(ctx context.Context, id string) error {
 		return fmt.Errorf("get message: %w", err)
 	}
 
+	if m.exceededReplayCap(msg) {
+		return m.quarantineMessage(ctx, msg, "max_replay_attempts")
+	}
 	if m.isTerminal(msg) {
-		return m.quarantineTerminal(ctx, msg)
+		return m.quarantineMessage(ctx, msg, "terminal_error")
 	}
 
 	if err := m.replayMessageWithRetry(ctx, msg); err != nil {
@@ -594,6 +654,9 @@ func (m *Manager) replayMessage(ctx context.Context, msg *Message) error {
 	metadata["dlq_replay"] = "true"
 	metadata["dlq_message_id"] = msg.ID
 	metadata["dlq_original_error"] = msg.Error
+	// Increment the replay counter so it accumulates across republish -> re-DLQ
+	// cycles, enabling the WithMaxReplayAttempts cap without dedup.
+	metadata[MetadataReplayCount] = strconv.Itoa(replayCount(msg) + 1)
 
 	return m.republisher.Send(ctx, msg.EventName, msg.OriginalID, msg.Payload, metadata)
 }

@@ -15,6 +15,13 @@ All changes are **additive and off by default**. Existing code that does not opt
 
 ### Added
 
+#### Max replay attempts (error-agnostic loop cap)
+
+- `WithMaxReplayAttempts(n int) ManagerOption` — caps how many times a single message may be replayed before it is quarantined, **regardless of why it fails**. Default `0` = unlimited (prior behaviour). The generic backstop against a permanently-failing message (decode error, a future type change, a bad payload) looping forever through republish → re-DLQ → republish.
+- The replay count rides in message metadata under the exported key `MetadataReplayCount` (`dlq_replay_count`); `replayMessage` increments it on each republish, so it accumulates across the republish→re-DLQ cycle **without** requiring dedup or a stable DB row.
+- Prefer this over `WithTerminalError` for guaranteed termination — it does not depend on matching error strings. The two compose; the quarantine reason (`max_replay_attempts` vs `terminal_error`) is logged.
+- Recommended for any auto-replay loop (a small value such as 3–5).
+
 #### Terminal-error quarantine
 
 - `WithTerminalError(func(*Message) bool) ManagerOption` — attach a predicate to the Manager. During `Replay` and `ReplaySingle`, messages for which the predicate returns true are quarantined instead of republished, preventing poison-message replay loops.

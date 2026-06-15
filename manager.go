@@ -95,6 +95,15 @@ type StoreParams struct {
 	// Payload is the message payload.
 	Payload []byte
 	// Metadata contains additional message metadata.
+	//
+	// IMPORTANT for WithMaxReplayAttempts: the replay-attempt counter
+	// (MetadataReplayCount / "dlq_replay_count") rides in this metadata and is
+	// what bounds the replay loop. When a replayed message fails and is re-DLQ'd,
+	// the caller MUST carry the delivered message's metadata through into this
+	// field so the counter accumulates across the republish->re-DLQ cycle. If the
+	// metadata is regenerated or stripped on re-DLQ, the counter resets to 0 and
+	// the WithMaxReplayAttempts cap will never fire. (event.Bus.sendToDLQ does
+	// this correctly out of the box; custom DLQ-store wiring must preserve it.)
 	Metadata map[string]string
 	// Err is the error that caused the failure.
 	Err error

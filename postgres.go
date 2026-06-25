@@ -652,11 +652,12 @@ func (s *PostgresStore) Health(ctx context.Context) *health.Result {
 	if err != nil {
 		return &health.Result{
 			Status:    health.StatusUnhealthy,
-			Message:   fmt.Sprintf("ping failed: %v", err),
+			Message:   "postgres store unreachable",
 			Latency:   time.Since(start),
 			CheckedAt: start,
 			Details: map[string]any{
 				"table": s.table,
+				"error": err.Error(),
 			},
 		}
 	}
@@ -667,11 +668,12 @@ func (s *PostgresStore) Health(ctx context.Context) *health.Result {
 	if err != nil {
 		return &health.Result{
 			Status:    health.StatusUnhealthy,
-			Message:   fmt.Sprintf("count failed: %v", err),
+			Message:   "postgres store count failed",
 			Latency:   time.Since(start),
 			CheckedAt: start,
 			Details: map[string]any{
 				"table": s.table,
+				"error": err.Error(),
 			},
 		}
 	}

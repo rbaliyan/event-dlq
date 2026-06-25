@@ -810,11 +810,12 @@ func (s *RedisStore) Health(ctx context.Context) *health.Result {
 	if err := s.client.Ping(ctx).Err(); err != nil {
 		return &health.Result{
 			Status:    health.StatusUnhealthy,
-			Message:   fmt.Sprintf("ping failed: %v", err),
+			Message:   "redis store unreachable",
 			Latency:   time.Since(start),
 			CheckedAt: start,
 			Details: map[string]any{
 				"time_key": s.timeKey,
+				"error":    err.Error(),
 			},
 		}
 	}
@@ -823,11 +824,12 @@ func (s *RedisStore) Health(ctx context.Context) *health.Result {
 	if err != nil {
 		return &health.Result{
 			Status:    health.StatusUnhealthy,
-			Message:   fmt.Sprintf("zcard failed: %v", err),
+			Message:   "redis store count failed",
 			Latency:   time.Since(start),
 			CheckedAt: start,
 			Details: map[string]any{
 				"time_key": s.timeKey,
+				"error":    err.Error(),
 			},
 		}
 	}

@@ -802,12 +802,13 @@ func (s *MongoStore) Health(ctx context.Context) *health.Result {
 	if err != nil {
 		return &health.Result{
 			Status:    health.StatusUnhealthy,
-			Message:   fmt.Sprintf("ping failed: %v", err),
+			Message:   "mongo store unreachable",
 			Latency:   time.Since(start),
 			CheckedAt: start,
 			Details: map[string]any{
 				"database":   s.collection.Database().Name(),
 				"collection": s.collection.Name(),
+				"error":      err.Error(),
 			},
 		}
 	}
@@ -818,12 +819,13 @@ func (s *MongoStore) Health(ctx context.Context) *health.Result {
 	if err != nil {
 		return &health.Result{
 			Status:    health.StatusUnhealthy,
-			Message:   fmt.Sprintf("count failed: %v", err),
+			Message:   "mongo store count failed",
 			Latency:   time.Since(start),
 			CheckedAt: start,
 			Details: map[string]any{
 				"database":   s.collection.Database().Name(),
 				"collection": s.collection.Name(),
+				"error":      err.Error(),
 			},
 		}
 	}

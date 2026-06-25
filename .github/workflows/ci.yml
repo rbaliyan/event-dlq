@@ -115,7 +115,7 @@ jobs:
 
       - name: Enforce coverage threshold
         env:
-          COVERAGE_THRESHOLD: "75"
+          COVERAGE_THRESHOLD: "85"
         run: |
           total=$(go tool cover -func=coverage.out | awk '/^total:/ {gsub(/%/,"",$3); print $3}')
           echo "Total coverage: ${total}% (threshold: ${COVERAGE_THRESHOLD}%)"

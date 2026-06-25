@@ -602,7 +602,7 @@ func TestManager_Metrics_RealBackend(t *testing.T) {
 				t.Fatalf("NewManager: %v", err)
 			}
 
-			if err := mgr.Store(ctx, StoreParams{EventName: "order.created", OriginalID: "mo1"}); err != nil {
+			if err := mgr.Store(ctx, StoreParams{EventName: "order.created", OriginalID: "mo1", Payload: []byte(`{}`)}); err != nil {
 				t.Fatalf("Store: %v", err)
 			}
 			if got := readPending(t, reader); got != 1 {

@@ -111,7 +111,21 @@ jobs:
           MONGO_URI: mongodb://localhost:27017
           POSTGRES_URI: postgres://postgres:postgres@localhost:5432/test?sslmode=disable
           REDIS_URI: localhost:6379
-        run: go test -tags integration -race ./...
+        run: go test -tags integration -race -coverpkg=github.com/rbaliyan/event-dlq -coverprofile=coverage.out ./...
+
+      - name: Enforce coverage threshold
+        env:
+          COVERAGE_THRESHOLD: "75"
+        run: |
+          total=$(go tool cover -func=coverage.out | awk '/^total:/ {gsub(/%/,"",$3); print $3}')
+          echo "Total coverage: ${total}% (threshold: ${COVERAGE_THRESHOLD}%)"
+          awk -v total="$total" -v threshold="$COVERAGE_THRESHOLD" 'BEGIN {
+            if (total + 0 < threshold + 0) {
+              printf "FAIL: coverage %.1f%% is below the %d%% threshold\n", total, threshold
+              exit 1
+            }
+            printf "OK: coverage %.1f%% meets the %d%% threshold\n", total, threshold
+          }'
 
   codeql:
     name: CodeQL Analysis

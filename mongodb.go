@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -176,7 +177,11 @@ func NewMongoStore(db *mongo.Database, opts ...MongoStoreOption) (*MongoStore, e
 		dedup:      o.dedup,
 	}
 	go func() { // #nosec G118 — background goroutine intentionally outlives constructor context
-		if err := s.EnsureIndexes(context.Background()); err != nil {
+		// Bound the background index build so it can't hang forever against a
+		// slow or unreachable cluster.
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		if err := s.EnsureIndexes(ctx); err != nil {
 			slog.Default().Error("failed to ensure DLQ indexes", "error", err, "collection", o.collection)
 		}
 	}()
@@ -540,7 +545,11 @@ func (s *MongoStore) buildFilter(filter Filter) bson.M {
 	}
 
 	if filter.Error != "" {
-		mongoFilter["error"] = bson.Regex{Pattern: filter.Error, Options: "i"}
+		// QuoteMeta escapes regex metacharacters so the caller-supplied Error is
+		// matched as a literal, case-insensitive substring — matching the
+		// "Contains" semantics the other backends use, and removing the ReDoS /
+		// regex-injection vector of compiling raw input as a pattern.
+		mongoFilter["error"] = bson.Regex{Pattern: regexp.QuoteMeta(filter.Error), Options: "i"}
 	}
 
 	if filter.MaxRetries > 0 {

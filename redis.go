@@ -155,15 +155,17 @@ type RedisStore struct {
 	originalPrefix  string // dlq:by_original:
 	eventOrigPrefix string // dlq:by_eventorig: — composite (event,original) dedup index
 	dedup           bool   // when true, Store upserts on (event_name, original_id)
+	maxListLimit    int    // when >0, caps List/Count-fallback result size
 }
 
 // RedisStoreOption configures a RedisStore.
 type RedisStoreOption func(*redisStoreOptions)
 
 type redisStoreOptions struct {
-	keyPrefix string
-	logger    *slog.Logger
-	dedup     bool
+	keyPrefix    string
+	logger       *slog.Logger
+	dedup        bool
+	maxListLimit int
 }
 
 // WithKeyPrefix sets a custom key prefix for all Redis keys.
@@ -200,6 +202,20 @@ func WithRedisDedup() RedisStoreOption {
 	}
 }
 
+// WithMaxListLimit caps the number of messages a single List (or the List-based
+// Count fallback) will return, protecting against an unbounded query exhausting
+// memory. A List with no Limit, or a Limit larger than the cap, is clamped to
+// the cap. The default is 0, meaning unbounded (no behavior change). Regardless
+// of this setting, List always fetches from Redis in bounded chunks rather than
+// materializing the whole range at once.
+func WithMaxListLimit(n int) RedisStoreOption {
+	return func(o *redisStoreOptions) {
+		if n > 0 {
+			o.maxListLimit = n
+		}
+	}
+}
+
 // NewRedisStore creates a new Redis DLQ store.
 func NewRedisStore(client redis.Cmdable, opts ...RedisStoreOption) (*RedisStore, error) {
 	if client == nil {
@@ -229,6 +245,7 @@ func NewRedisStore(client redis.Cmdable, opts ...RedisStoreOption) (*RedisStore,
 		originalPrefix:  o.keyPrefix + "by_original:",
 		eventOrigPrefix: o.keyPrefix + "by_eventorig:",
 		dedup:           o.dedup,
+		maxListLimit:    o.maxListLimit,
 	}, nil
 }
 
@@ -399,6 +416,11 @@ func timeRange(filter Filter) *redis.ZRangeBy {
 	return r
 }
 
+// redisListChunkSize bounds how many sorted-set entries List fetches per round
+// trip. It is a var (not a const) only so tests can exercise the multi-chunk
+// paging path without seeding thousands of messages.
+var redisListChunkSize = 1000
+
 // List returns messages matching the filter.
 //
 // Time bounds (After, Before) are pushed to Redis via ZRANGEBYSCORE for
@@ -406,57 +428,86 @@ func timeRange(filter Filter) *redis.ZRangeBy {
 // Remaining filters (Source, Error, MaxRetries, ExcludeRetried) are applied
 // in-memory after the bulk fetch.
 func (s *RedisStore) List(ctx context.Context, filter Filter) ([]*Message, error) {
+	return s.scan(ctx, s.clampLimit(filter))
+}
+
+// scan executes the chunked sorted-set walk + in-memory filtering for List and
+// the Count fallback. It honors the filter's own Limit/Offset but applies no
+// max-limit cap — callers (List) clamp first; Count must scan uncapped to return
+// an accurate total.
+func (s *RedisStore) scan(ctx context.Context, filter Filter) ([]*Message, error) {
 	key := s.timeKey
 	if filter.EventName != "" {
 		key = s.eventPrefix + filter.EventName
 	}
 
-	ids, err := s.client.ZRangeByScore(ctx, key, timeRange(filter)).Result()
-	if err != nil {
-		return nil, fmt.Errorf("zrangebyscore: %w", err)
+	// Once we hold offset+limit post-filtered messages we can stop scanning.
+	// effectiveMax == 0 means unbounded (the caller asked for everything).
+	effectiveMax := 0
+	if filter.Limit > 0 {
+		effectiveMax = filter.Offset + filter.Limit
 	}
 
-	if len(ids) == 0 {
-		return nil, nil
-	}
+	// Page the sorted set in bounded chunks (ZRANGEBYSCORE ... LIMIT off cnt)
+	// rather than materializing the entire range and pipelining every hash at
+	// once — that was an unbounded-memory DoS on large DLQs.
+	chunkSize := redisListChunkSize
+	zr := timeRange(filter)
+	zr.Count = int64(chunkSize)
 
-	// Batch-fetch all message hashes in one pipeline.
-	pipe := s.client.Pipeline()
-	cmds := make([]*redis.MapStringStringCmd, len(ids))
-	for i, id := range ids {
-		cmds[i] = pipe.HGetAll(ctx, s.msgPrefix+id)
-	}
-	if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
-		return nil, fmt.Errorf("pipeline hgetall: %w", err)
-	}
-
-	// Parse and apply in-memory filters.
 	var messages []*Message
-	for _, cmd := range cmds {
-		fields, err := cmd.Result()
-		if err != nil || len(fields) == 0 {
-			continue
-		}
-		msg, err := s.parseMessage(fields)
+	for pageOffset := int64(0); ; pageOffset += int64(chunkSize) {
+		zr.Offset = pageOffset
+		ids, err := s.client.ZRangeByScore(ctx, key, zr).Result()
 		if err != nil {
-			continue
+			return nil, fmt.Errorf("zrangebyscore: %w", err)
 		}
-		if filter.ExcludeRetried && msg.RetriedAt != nil {
-			continue
+		if len(ids) == 0 {
+			break
 		}
-		if filter.ExcludeQuarantined && msg.QuarantinedAt != nil {
-			continue
+
+		pipe := s.client.Pipeline()
+		cmds := make([]*redis.MapStringStringCmd, len(ids))
+		for i, id := range ids {
+			cmds[i] = pipe.HGetAll(ctx, s.msgPrefix+id)
 		}
-		if filter.MaxRetries > 0 && msg.RetryCount > filter.MaxRetries {
-			continue
+		if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
+			return nil, fmt.Errorf("pipeline hgetall: %w", err)
 		}
-		if filter.Source != "" && msg.Source != filter.Source {
-			continue
+
+		for _, cmd := range cmds {
+			fields, err := cmd.Result()
+			if err != nil || len(fields) == 0 {
+				continue
+			}
+			msg, err := s.parseMessage(fields)
+			if err != nil {
+				continue
+			}
+			if filter.ExcludeRetried && msg.RetriedAt != nil {
+				continue
+			}
+			if filter.ExcludeQuarantined && msg.QuarantinedAt != nil {
+				continue
+			}
+			if filter.MaxRetries > 0 && msg.RetryCount > filter.MaxRetries {
+				continue
+			}
+			if filter.Source != "" && msg.Source != filter.Source {
+				continue
+			}
+			if filter.Error != "" && !strings.Contains(strings.ToLower(msg.Error), strings.ToLower(filter.Error)) {
+				continue
+			}
+			messages = append(messages, msg)
 		}
-		if filter.Error != "" && !strings.Contains(strings.ToLower(msg.Error), strings.ToLower(filter.Error)) {
-			continue
+
+		if effectiveMax > 0 && len(messages) >= effectiveMax {
+			break // have enough to satisfy offset+limit
 		}
-		messages = append(messages, msg)
+		if len(ids) < chunkSize {
+			break // last page of the sorted set
+		}
 	}
 
 	if filter.Offset > 0 {
@@ -470,6 +521,15 @@ func (s *RedisStore) List(ctx context.Context, filter Filter) ([]*Message, error
 	}
 
 	return messages, nil
+}
+
+// clampLimit applies the configured max-list-limit to a filter: a Limit of 0
+// ("all") or one above the cap is reduced to the cap. A cap of 0 is unbounded.
+func (s *RedisStore) clampLimit(filter Filter) Filter {
+	if s.maxListLimit > 0 && (filter.Limit <= 0 || filter.Limit > s.maxListLimit) {
+		filter.Limit = s.maxListLimit
+	}
+	return filter
 }
 
 // Count returns the number of messages matching the filter.
@@ -496,7 +556,9 @@ func (s *RedisStore) Count(ctx context.Context, filter Filter) (int64, error) {
 	countFilter := filter
 	countFilter.Offset = 0
 	countFilter.Limit = 0
-	messages, err := s.List(ctx, countFilter)
+	// Use scan (not List) so the count is accurate and uncapped; scan still
+	// walks the sorted set in bounded chunks.
+	messages, err := s.scan(ctx, countFilter)
 	if err != nil {
 		return 0, err
 	}

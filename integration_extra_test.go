@@ -622,3 +622,34 @@ func TestManager_Metrics_RealBackend(t *testing.T) {
 		})
 	}
 }
+
+// TestMongoErrorFilterMatchesLiterally verifies the Error filter is matched as a
+// literal substring, not compiled as a regex. The pattern "(timeout)" matches
+// the message containing that exact text but not one that merely contains
+// "timeout" — which a raw regex (a capture group) would have matched.
+func TestMongoErrorFilterMatchesLiterally(t *testing.T) {
+	ctx := context.Background()
+	store := newMongoDedupStore(t)
+
+	if err := store.Store(ctx, &Message{
+		ID: "lit-1", EventName: "e", OriginalID: "lo1", Payload: []byte(`{}`),
+		Error: "boom (timeout) downstream", CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatalf("seed 1: %v", err)
+	}
+	if err := store.Store(ctx, &Message{
+		ID: "lit-2", EventName: "e", OriginalID: "lo2", Payload: []byte(`{}`),
+		Error: "boom timeout downstream", CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatalf("seed 2: %v", err)
+	}
+
+	got, err := store.List(ctx, Filter{Error: "(timeout)"})
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != "lit-1" {
+		t.Fatalf("literal Error filter %q must match only lit-1, got %d results %+v",
+			"(timeout)", len(got), got)
+	}
+}

@@ -468,6 +468,27 @@ removed, err := store.MigrateDedup(ctx, dlq.WithForce())
 6. **Use terminal-error quarantine**: Wire `WithTerminalError` to prevent poison messages from blocking replay sweeps indefinitely
 7. **Enable dedup for recurring failures**: Use `With*Dedup()` when the same original message may re-enter the DLQ multiple times; run `MigrateDedup` on any pre-existing table first
 
+## Security and data handling
+
+This is a storage/replay library; the calling service owns the database clients
+and therefore the security boundary. Keep the following in mind:
+
+- **DLQ contents inherit the sensitivity of the source event.** Payloads and
+  metadata are stored verbatim, so a DLQ is a long-lived copy of production data
+  (which may include PII/PHI). Protect it at rest the same way you protect the
+  source: encrypted column/collection, restricted access, and a retention policy
+  (schedule `Cleanup`). `Message.Error` can also contain payload-derived text —
+  avoid logging it at info level in regulated contexts.
+- **Access control is the caller's responsibility.** The library performs no
+  authentication or authorization; whoever can call `List`/`Replay`/`Delete` can
+  read and act on every stored message. Gate these behind your own authz, and
+  configure TLS/credentials on the `*sql.DB` / `mongo.Client` / `redis.Client`
+  you inject.
+- **Bound large queries.** `List`/`Count` with no `Filter.Limit` return every
+  match; always set a `Limit` in production. For Redis, `NewRedisStore(client,
+  dlq.WithMaxListLimit(n))` caps result size (and Redis always fetches the range
+  in bounded chunks regardless), so an unbounded query can't exhaust memory.
+
 ## Examples
 
 See the `examples/` directory for a complete at-least-once delivery example that demonstrates:

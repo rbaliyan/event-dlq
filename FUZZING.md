@@ -23,6 +23,7 @@ target can't be silently left un-fuzzed.
 | `FuzzTerminalErrorMatching` | `TerminalErrorMatching` predicate | matches iff error is non-empty and contains a pattern; empty error never matches |
 | `FuzzRedisParseMessage` | `RedisStore.parseMessage` (JSON + int decode of Redis hash data) | never panics; on success the mapped fields, parsed counts, and timestamps round-trip |
 | `FuzzMemoryDedupUpsert` | dedup re-store path (`MemoryStore.Store` with dedup on) | second store of the same key collapses to one row: retry_count+1, latest error/payload/metadata, created_at preserved, retried_at cleared; empty OriginalID inserts distinct |
+| `FuzzMongoDecode` | `decodeMongoDoc` (BSON unmarshal of Mongo `Get`/`List` documents) | never panics on arbitrary bytes; malformed BSON is rejected; a successful decode yields a non-nil message |
 
 ## Running locally
 
@@ -37,3 +38,20 @@ go test -run '^$' -fuzz='^FuzzNormalizeErrorType$' -fuzztime=30s .
 
 Seed and regression corpora live under `testdata/fuzz/<Target>/` and are
 committed so a discovered crasher is replayed on every run.
+
+## Triaging a crash
+
+When a fuzz target fails (locally or in CI), Go writes the failing input to
+`testdata/fuzz/<Target>/<hash>`. To triage:
+
+1. **Reproduce deterministically** — the written seed replays as a normal test:
+   `go test -run '<Target>/<hash>' .` (no `-fuzz`). It fails the same way every run.
+2. **Read the input** — the corpus file is human-readable (`go test fuzz v1`
+   header followed by the typed arguments), so you can see exactly what tripped
+   the oracle.
+3. **Fix the code, not the test** — if the target found a real defect, fix the
+   production code and keep the assertion that caught it. The corpus file is the
+   regression test; commit it.
+4. **A ClusterFuzzLite finding** is uploaded to GitHub code-scanning (SARIF) with
+   a minimized reproducer; download it into `testdata/fuzz/<Target>/` and follow
+   steps 1–3.

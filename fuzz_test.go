@@ -2,11 +2,14 @@ package dlq
 
 import (
 	"context"
+	"encoding/json"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 	"unicode/utf8"
+
+	"go.mongodb.org/mongo-driver/v2/bson"
 )
 
 // FuzzMatchesFilter checks invariants of the predicate rather than only that it
@@ -222,6 +225,37 @@ func FuzzTerminalErrorMatching(f *testing.F) {
 	})
 }
 
+// FuzzMongoDecode fuzzes the BSON document decoder (decodeMongoDoc) — the
+// untrusted-input path the Mongo store uses for every Get/List result. It must
+// never panic on arbitrary bytes; malformed BSON is rejected with an error, and
+// a successful decode yields a non-nil message.
+func FuzzMongoDecode(f *testing.F) {
+	// Seed with valid BSON so the fuzzer mutates real document structure.
+	seeds := []mongoMessage{
+		{ID: "d1", EventName: "orders.created", OriginalID: "o1", Payload: []byte("payload"), Error: "boom", RetryCount: 2, CreatedAt: time.Unix(1700000000, 0)},
+		{ID: "", EventName: "", Metadata: map[string]string{"trace": "abc"}},
+	}
+	for _, mm := range seeds {
+		if raw, err := bson.Marshal(mm); err == nil {
+			f.Add(raw)
+		}
+	}
+	f.Add([]byte{})
+	f.Add([]byte("not a bson document"))
+
+	f.Fuzz(func(t *testing.T, raw []byte) {
+		msg, err := decodeMongoDoc(raw)
+		if err != nil {
+			return // malformed BSON rejected — acceptable
+		}
+		if msg == nil {
+			t.Fatal("decodeMongoDoc returned nil message with nil error")
+		}
+		// toMessage is a pure field copy; the property under test is that no
+		// crafted BSON makes the decode panic or yield a nil-with-nil-error.
+	})
+}
+
 // FuzzMemoryDedupUpsert asserts the documented dedup upsert invariants: a second
 // store of the same non-empty (EventName, OriginalID) collapses into the first
 // row (retry_count incremented, error/payload/metadata updated to the latest,
@@ -319,7 +353,30 @@ func FuzzRedisParseMessage(f *testing.F) {
 			"quarantined_at": quarantinedAt,
 		}
 
+		// Undecodable inputs must be rejected with an error, not silently
+		// accepted with zeroed fields. (json.Valid is a lower bound: valid JSON
+		// that isn't a string map still fails Unmarshal, which is also fine.)
+		shouldFail := false
+		if retryCount != "" {
+			if _, e := strconv.Atoi(retryCount); e != nil {
+				shouldFail = true
+			}
+		}
+		for _, ts := range []string{createdAt, retriedAt, quarantinedAt} {
+			if ts != "" {
+				if _, e := strconv.ParseInt(ts, 10, 64); e != nil {
+					shouldFail = true
+				}
+			}
+		}
+		if metadata != "" && !json.Valid([]byte(metadata)) {
+			shouldFail = true
+		}
+
 		msg, err := store.parseMessage(fields)
+		if shouldFail && err == nil {
+			t.Errorf("parseMessage accepted undecodable input (should reject): %+v", fields)
+		}
 		if err != nil {
 			return // malformed input rejected with an error — acceptable
 		}

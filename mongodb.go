@@ -68,6 +68,17 @@ type mongoMessage struct {
 	QuarantinedAt *time.Time        `bson:"quarantined_at,omitempty"`
 }
 
+// decodeMongoDoc decodes a raw BSON document into a Message. Centralizing the
+// decode keeps Get and List consistent and lets the BSON unmarshal path — an
+// untrusted-input decode — be fuzzed (FuzzMongoDecode) without a live MongoDB.
+func decodeMongoDoc(raw bson.Raw) (*Message, error) {
+	var mm mongoMessage
+	if err := bson.Unmarshal(raw, &mm); err != nil {
+		return nil, fmt.Errorf("unmarshal bson: %w", err)
+	}
+	return mm.toMessage(), nil
+}
+
 // toMessage converts mongoMessage to Message
 func (m *mongoMessage) toMessage() *Message {
 	return &Message{
@@ -458,8 +469,7 @@ func (s *MongoStore) upsertDedup(ctx context.Context, msg *Message) error {
 func (s *MongoStore) Get(ctx context.Context, id string) (*Message, error) {
 	filter := bson.M{"_id": id}
 
-	var mongoMsg mongoMessage
-	err := s.collection.FindOne(ctx, filter).Decode(&mongoMsg)
+	raw, err := s.collection.FindOne(ctx, filter).Raw()
 	if err != nil {
 		if errors.Is(err, mongo.ErrNoDocuments) {
 			return nil, fmt.Errorf("%s: %w", id, ErrNotFound)
@@ -467,7 +477,7 @@ func (s *MongoStore) Get(ctx context.Context, id string) (*Message, error) {
 		return nil, fmt.Errorf("find: %w", err)
 	}
 
-	return mongoMsg.toMessage(), nil
+	return decodeMongoDoc(raw)
 }
 
 // List returns messages matching the filter
@@ -490,11 +500,11 @@ func (s *MongoStore) List(ctx context.Context, filter Filter) ([]*Message, error
 
 	var messages []*Message
 	for cursor.Next(ctx) {
-		var mongoMsg mongoMessage
-		if err := cursor.Decode(&mongoMsg); err != nil {
+		msg, err := decodeMongoDoc(cursor.Current)
+		if err != nil {
 			return nil, fmt.Errorf("decode: %w", err)
 		}
-		messages = append(messages, mongoMsg.toMessage())
+		messages = append(messages, msg)
 	}
 
 	if err := cursor.Err(); err != nil {
@@ -759,8 +769,7 @@ func (s *MongoStore) Stats(ctx context.Context) (*Stats, error) {
 func (s *MongoStore) GetByOriginalID(ctx context.Context, originalID string) (*Message, error) {
 	filter := bson.M{"original_id": originalID}
 
-	var mongoMsg mongoMessage
-	err := s.collection.FindOne(ctx, filter).Decode(&mongoMsg)
+	raw, err := s.collection.FindOne(ctx, filter).Raw()
 	if err != nil {
 		if errors.Is(err, mongo.ErrNoDocuments) {
 			return nil, fmt.Errorf("original_id %s: %w", originalID, ErrNotFound)
@@ -768,7 +777,7 @@ func (s *MongoStore) GetByOriginalID(ctx context.Context, originalID string) (*M
 		return nil, fmt.Errorf("find: %w", err)
 	}
 
-	return mongoMsg.toMessage(), nil
+	return decodeMongoDoc(raw)
 }
 
 // Health performs a health check by pinging the MongoDB database and counting documents.

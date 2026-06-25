@@ -6,3 +6,4 @@ compile_native_go_fuzzer github.com/rbaliyan/event-dlq FuzzReplayCount fuzz_repl
 compile_native_go_fuzzer github.com/rbaliyan/event-dlq FuzzTerminalErrorMatching fuzz_terminal_error_matching
 compile_native_go_fuzzer github.com/rbaliyan/event-dlq FuzzRedisParseMessage fuzz_redis_parse_message
 compile_native_go_fuzzer github.com/rbaliyan/event-dlq FuzzMemoryDedupUpsert fuzz_memory_dedup_upsert
+compile_native_go_fuzzer github.com/rbaliyan/event-dlq FuzzMongoDecode fuzz_mongo_decode

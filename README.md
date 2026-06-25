@@ -7,7 +7,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/rbaliyan/event-dlq/badge)](https://scorecard.dev/viewer/?uri=github.com/rbaliyan/event-dlq)
 
-Dead Letter Queue (DLQ) management package for the [event](https://github.com/rbaliyan/event) pub-sub library.
+Dead Letter Queue (DLQ) management package for the [event/v3](https://github.com/rbaliyan/event) pub-sub library.
 
 ## Overview
 
@@ -40,22 +40,58 @@ go get github.com/rbaliyan/event-dlq
 
 ```go
 import (
-    "github.com/rbaliyan/event-dlq"
-    "github.com/rbaliyan/event/v3/transport"
+    dlq "github.com/rbaliyan/event-dlq"
+    "github.com/rbaliyan/event/v3"
 )
 
-// Create a store (choose one based on your infrastructure)
-store := dlq.NewMemoryStore()                    // For testing
-// store := dlq.NewPostgresStore(db)             // For PostgreSQL
-// store := dlq.NewMongoStore(mongoDatabase)     // For MongoDB
-// store := dlq.NewRedisStore(redisClient)       // For Redis
+// Create a store (choose one based on your infrastructure).
+// NewMemoryStore never fails; the persistent constructors return an error.
+store := dlq.NewMemoryStore()                          // For testing
+// store, err := dlq.NewPostgresStore(db)              // For PostgreSQL
+// store, err := dlq.NewMongoStore(mongoDatabase)      // For MongoDB
+// store, err := dlq.NewRedisStore(redisClient)        // For Redis
 
-// Create the manager with your transport
-manager, err := dlq.NewManager(store, transport)
+// Create the manager. The second argument is a Republisher (an event.Sender),
+// so pass an *event.Bus — it can publish to all transports. Transports that
+// cannot publish on their own must go through a bus; see NewManagerWithTransport
+// for the transport-based constructor.
+manager, err := dlq.NewManager(store, bus)
 if err != nil {
     log.Fatal(err)
 }
 ```
+
+If you already have a `transport.Transport` that can publish on its own and don't
+want to wire up a bus just for replay, use `NewManagerWithTransport(store, transport, ...)`,
+which wraps the transport in a `Republisher` adapter. Transports that cannot
+publish (e.g. MongoDB) must still go through an `*event.Bus`.
+
+### Automatic Capture from the Event Bus
+
+To have the event bus route failed messages into the DLQ automatically, wrap a
+store with `NewStoreAdapter` and pass it to `event.WithDLQ`. The adapter
+implements the `event.DLQStore` interface, generating a DLQ message ID and tagging
+every captured message with the given source:
+
+```go
+store := dlq.NewMemoryStore()
+
+bus, err := event.NewBus("orders",
+    event.WithTransport(tr),
+    event.WithDLQ(dlq.NewStoreAdapter(store, "order-service")),
+)
+if err != nil {
+    log.Fatal(err)
+}
+
+// The bus now writes any message that exhausts its retries to `store`.
+// Use a Manager over the same store to inspect, replay, or clean up:
+manager, err := dlq.NewManager(store, bus)
+```
+
+This is the recommended production wiring: the bus captures failures, and the
+`Manager` drives replay and cleanup. See [`examples/main.go`](examples/main.go)
+for a complete at-least-once setup.
 
 ### Storing Failed Messages
 
@@ -96,7 +132,7 @@ messages, err := manager.List(ctx, dlq.Filter{
 
 // List messages from the last 24 hours
 messages, err := manager.List(ctx, dlq.Filter{
-    StartTime: time.Now().Add(-24 * time.Hour),
+    After: time.Now().Add(-24 * time.Hour),
 })
 
 // List messages with specific error pattern
@@ -115,6 +151,13 @@ if err != nil {
 }
 fmt.Printf("Event: %s, Error: %s, Retries: %d\n",
     msg.EventName, msg.Error, msg.RetryCount)
+```
+
+When you only know the original event message ID (not the generated DLQ ID),
+look it up with `GetByOriginalID`:
+
+```go
+msg, err := manager.GetByOriginalID(ctx, "original-event-id")
 ```
 
 ### Counting Messages
@@ -185,6 +228,25 @@ fmt.Printf("Retried: %d\n", stats.RetriedMessages)
 
 for event, count := range stats.MessagesByEvent {
     fmt.Printf("  %s: %d\n", event, count)
+}
+```
+
+`Stats.PendingMessages` excludes quarantined messages (see
+[Preventing replay loops](#preventing-replay-loops-terminal-error-quarantine)),
+and `Stats.QuarantinedMessages` reports them separately.
+
+### Health Checks
+
+`Manager.Health` (and each persistent store) implements the `health.Checker`
+interface, so the DLQ can participate in a service health endpoint:
+
+```go
+result := manager.Health(ctx)
+switch result.Status {
+case health.StatusUnhealthy:
+    log.Printf("DLQ unreachable: %s", result.Message)
+case health.StatusDegraded:
+    log.Printf("DLQ healthy but has a backlog: %s", result.Message)
 }
 ```
 
@@ -321,6 +383,22 @@ dlq.WithTerminalError(func(msg *dlq.Message) bool {
 - The OTel counter `dlq_messages_quarantined_total{event}` increments on each quarantine.
 - `Quarantine(ctx, id)` (and replaying a terminal message by ID via `ReplaySingle`) returns `ErrNotFound` if no message with that ID exists.
 
+### Capping replay attempts (error-agnostic loop guard)
+
+`WithTerminalError` only stops messages whose failure you can recognise by its error text. `WithMaxReplayAttempts` is the error-agnostic backstop: it quarantines a message once it has been replayed `n` times, **regardless of why it keeps failing**. This is the recommended way to guarantee termination — prefer it over `WithTerminalError` when you need a hard ceiling against any permanently-failing message (decode errors, a future type change, a bad payload):
+
+```go
+manager, err := dlq.NewManager(store, bus,
+    dlq.WithMaxReplayAttempts(5), // quarantine after the 5th replay
+)
+```
+
+**Behaviour at a glance:**
+- Default is `0` — unlimited replays (prior behaviour, no quarantine on count).
+- When `n > 0`, a message is quarantined once it has been replayed `n` times. The cap is checked before the `WithTerminalError` predicate, so the stronger termination guarantee wins.
+- The attempt count rides in message metadata under the `MetadataReplayCount` key (`dlq_replay_count`) and is incremented on each republish, so it accumulates across the republish → re-DLQ cycle **without** requiring deduplication or a stable row. Preserve delivered metadata through your handler or the counter resets and the cap never fires.
+- Quarantine reason is recorded as `max_replay_attempts` (versus `terminal_error` for the predicate path), so the two backstops are distinguishable in logs.
+
 ### Stopping an active poison-replay loop (operational runbook)
 
 If a deployment is already caught in a replay loop before quarantine is configured:
@@ -328,7 +406,7 @@ If a deployment is already caught in a replay loop before quarantine is configur
 1. **Disable the scheduled Replay job** to stop further republishing.
 2. **Identify and purge the poison rows** — use `DeleteByFilter` or a direct query filtered by the known error pattern.
 3. **Fix the upstream decode/schema error** that caused the permanent failures.
-4. Re-deploy with `WithTerminalError` wired into the Manager.
+4. Re-deploy with `WithMaxReplayAttempts` (and/or `WithTerminalError`) wired into the Manager.
 5. **Re-enable the Replay job**.
 
 ## Optional deduplication

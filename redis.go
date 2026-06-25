@@ -202,13 +202,13 @@ func WithRedisDedup() RedisStoreOption {
 	}
 }
 
-// WithMaxListLimit caps the number of messages a single List (or the List-based
-// Count fallback) will return, protecting against an unbounded query exhausting
-// memory. A List with no Limit, or a Limit larger than the cap, is clamped to
-// the cap. The default is 0, meaning unbounded (no behavior change). Regardless
-// of this setting, List always fetches from Redis in bounded chunks rather than
-// materializing the whole range at once.
-func WithMaxListLimit(n int) RedisStoreOption {
+// WithRedisMaxListLimit caps the number of messages a single List will return,
+// protecting against an unbounded query exhausting memory. A List with no Limit,
+// or a Limit larger than the cap, is clamped to the cap. The default is 0,
+// meaning unbounded (no behavior change). Count is never capped (it scans
+// uncapped to return an accurate total). Regardless of this setting, List always
+// fetches from Redis in bounded chunks rather than materializing the whole range.
+func WithRedisMaxListLimit(n int) RedisStoreOption {
 	return func(o *redisStoreOptions) {
 		if n > 0 {
 			o.maxListLimit = n
@@ -428,7 +428,7 @@ var redisListChunkSize = 1000
 // Remaining filters (Source, Error, MaxRetries, ExcludeRetried) are applied
 // in-memory after the bulk fetch.
 func (s *RedisStore) List(ctx context.Context, filter Filter) ([]*Message, error) {
-	return s.scan(ctx, s.clampLimit(filter))
+	return s.scan(ctx, clampListLimit(filter, s.maxListLimit))
 }
 
 // scan executes the chunked sorted-set walk + in-memory filtering for List and
@@ -521,15 +521,6 @@ func (s *RedisStore) scan(ctx context.Context, filter Filter) ([]*Message, error
 	}
 
 	return messages, nil
-}
-
-// clampLimit applies the configured max-list-limit to a filter: a Limit of 0
-// ("all") or one above the cap is reduced to the cap. A cap of 0 is unbounded.
-func (s *RedisStore) clampLimit(filter Filter) Filter {
-	if s.maxListLimit > 0 && (filter.Limit <= 0 || filter.Limit > s.maxListLimit) {
-		filter.Limit = s.maxListLimit
-	}
-	return filter
 }
 
 // Count returns the number of messages matching the filter.

@@ -41,7 +41,7 @@ func seedRedis(t *testing.T, store *RedisStore, n int) {
 // accurate (Count must not be capped).
 func TestRedisMaxListLimit(t *testing.T) {
 	ctx := context.Background()
-	store := newMaxLimitRedisStore(t, WithMaxListLimit(10))
+	store := newMaxLimitRedisStore(t, WithRedisMaxListLimit(10))
 	seedRedis(t, store, 25)
 
 	// List with no explicit Limit is clamped to the cap.

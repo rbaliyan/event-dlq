@@ -22,6 +22,19 @@ test-race:
 smoke:
     go test -run 'TestSmoke|Contract' -race ./...
 
+# Run all benchmarks (executes them and reports allocations)
+bench:
+    go test -run '^$' -bench=. -benchmem ./...
+
+# Fuzz each target briefly; override the per-target time with `just fuzz 1m`
+fuzz time="30s":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for t in FuzzMatchesFilter FuzzNormalizeErrorType FuzzStoreAndFilterMessages; do
+        echo "== fuzzing $t =="
+        go test -run '^$' -fuzz="^$t\$" -fuzztime={{time}} .
+    done
+
 # Run tests with coverage
 test-cover:
     go test -cover ./...

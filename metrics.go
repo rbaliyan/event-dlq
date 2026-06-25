@@ -3,6 +3,7 @@ package dlq
 import (
 	"context"
 	"sync"
+	"unicode/utf8"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -294,9 +295,23 @@ func normalizeErrorType(errMsg string) string {
 		}
 	}
 
-	// Truncate long error messages
-	if len(errMsg) > 50 {
-		return errMsg[:50]
+	// Truncate long error messages. The 50 is a byte budget; if the cut lands in
+	// the middle of a multi-byte rune, back off to that rune's start so we never
+	// split a valid rune into invalid UTF-8 (which would corrupt the metric
+	// attribute). Only the cut point is adjusted — bytes before it are left as-is.
+	const maxLen = 50
+	if len(errMsg) > maxLen {
+		end := maxLen
+		for end > 0 && !utf8.RuneStart(errMsg[end]) {
+			end--
+		}
+		if end == 0 {
+			// Pathological input with no rune boundary in the budget (e.g. all
+			// continuation bytes). Keep the raw cut so we never return empty;
+			// such input was already invalid UTF-8 going in.
+			end = maxLen
+		}
+		return errMsg[:end]
 	}
 
 	return errMsg

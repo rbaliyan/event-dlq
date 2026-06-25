@@ -2,3 +2,7 @@
 compile_native_go_fuzzer github.com/rbaliyan/event-dlq FuzzMatchesFilter fuzz_matches_filter
 compile_native_go_fuzzer github.com/rbaliyan/event-dlq FuzzNormalizeErrorType fuzz_normalize_error_type
 compile_native_go_fuzzer github.com/rbaliyan/event-dlq FuzzStoreAndFilterMessages fuzz_store_and_filter_messages
+compile_native_go_fuzzer github.com/rbaliyan/event-dlq FuzzReplayCount fuzz_replay_count
+compile_native_go_fuzzer github.com/rbaliyan/event-dlq FuzzTerminalErrorMatching fuzz_terminal_error_matching
+compile_native_go_fuzzer github.com/rbaliyan/event-dlq FuzzRedisParseMessage fuzz_redis_parse_message
+compile_native_go_fuzzer github.com/rbaliyan/event-dlq FuzzMemoryDedupUpsert fuzz_memory_dedup_upsert

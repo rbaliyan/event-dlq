@@ -62,6 +62,50 @@ jobs:
         # (shared CI runners are too noisy for reliable timing thresholds).
         run: go test -run '^$' -bench=. -benchmem -benchtime=10x ./...
 
+      - name: Check allocation invariants
+        # Allocation counts are deterministic (unlike ns/op on shared runners), so
+        # per-benchmark allocs/op ceilings are a safe, meaningful regression gate.
+        # Bump a ceiling here deliberately when a real change adds an allocation.
+        run: |
+          set -euo pipefail
+          check() {
+            local bench=$1 max=$2
+            echo "checking $bench (max ${max} allocs/op)"
+            go test -run '^$' -bench="^${bench}$" -benchmem -benchtime=100x . \
+              | awk -v max="$max" -v name="$bench" '
+                  /allocs\/op/ {
+                    for (i = 1; i <= NF; i++) {
+                      if ($i == "allocs/op" && $(i-1)+0 > max+0) {
+                        printf "ALLOC REGRESSION: %s = %s allocs/op (max %s)\n    %s\n", name, $(i-1), max, $0
+                        bad = 1
+                      }
+                    }
+                  }
+                  END { exit bad }'
+          }
+          check BenchmarkMemoryStoreCount 0
+          check BenchmarkMemoryStoreDeleteOlderThan 0
+          check BenchmarkMemoryStoreGet 4
+          echo "allocation invariants OK"
+
+  fuzz-sync:
+    name: Fuzz Target Sync
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Verify fuzz target lists match the source
+        # Every Fuzz* function must be listed in both the CI matrix below and the
+        # ClusterFuzzLite build, so a new target can't be silently left un-fuzzed.
+        run: |
+          src=$(grep -ohE '^func (Fuzz[A-Za-z0-9_]+)' *_test.go | awk '{print $2}' | sort -u)
+          ci=$(grep -oE '^[[:space:]]*- Fuzz[A-Za-z0-9_]+' .github/workflows/ci.yml | grep -oE 'Fuzz[A-Za-z0-9_]+' | sort -u)
+          bsh=$(grep -oE ' Fuzz[A-Za-z0-9_]+ ' .clusterfuzzlite/build.sh | grep -oE 'Fuzz[A-Za-z0-9_]+' | sort -u)
+          if [ "$src" != "$ci" ]; then echo "drift: source vs ci.yml fuzz matrix"; diff <(echo "$src") <(echo "$ci") || true; exit 1; fi
+          if [ "$src" != "$bsh" ]; then echo "drift: source vs ClusterFuzzLite build.sh"; diff <(echo "$src") <(echo "$bsh") || true; exit 1; fi
+          echo "fuzz targets in sync:"; echo "$src"
+
   fuzz:
     name: Fuzz
     needs: smoke
@@ -73,6 +117,10 @@ jobs:
           - FuzzMatchesFilter
           - FuzzNormalizeErrorType
           - FuzzStoreAndFilterMessages
+          - FuzzReplayCount
+          - FuzzTerminalErrorMatching
+          - FuzzRedisParseMessage
+          - FuzzMemoryDedupUpsert
     steps:
       - name: Checkout code
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3

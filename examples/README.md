@@ -127,8 +127,11 @@ bus, _ := event.NewBus("orders",
 **Purpose:** Store messages that fail permanently after all retries.
 
 ```go
-dlqStore := dlq.NewMongoStore(db.Collection("_dlq"))
-dlqManager, err := dlq.NewManager(dlqStore, transport)
+dlqStore, err := dlq.NewMongoStore(db, dlq.WithCollection("_dlq"))
+if err != nil {
+    log.Fatal(err)
+}
+dlqManager, err := dlq.NewManager(dlqStore, bus)
 if err != nil {
     log.Fatal(err)
 }

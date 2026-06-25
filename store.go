@@ -23,8 +23,11 @@
 // # Basic Usage
 //
 //	// Create store and manager
-//	store := dlq.NewPostgresStore(db)
-//	manager, err := dlq.NewManager(store, transport)
+//	store, err := dlq.NewPostgresStore(db)
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
+//	manager, err := dlq.NewManager(store, bus)
 //	if err != nil {
 //	    log.Fatal(err)
 //	}
@@ -101,7 +104,7 @@ type Message struct {
 	Error         string            // Error that caused the failure
 	RetryCount    int               // Number of retries attempted before DLQ
 	CreatedAt     time.Time         // When the message was added to DLQ
-	RetriedAt     *time.Time        // When the message was last replayed (nil if never)
+	RetriedAt     *time.Time        // When the message was last replayed (nil if never; reverts to nil if a dedup re-store re-queues it)
 	QuarantinedAt *time.Time        // When Replay classified this as terminal (nil if not quarantined)
 	Source        string            // Source system/service that produced the error
 }

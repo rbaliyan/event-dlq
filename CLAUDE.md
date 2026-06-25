@@ -22,6 +22,7 @@ Dead Letter Queue (DLQ) package for the `github.com/rbaliyan/event` event pub-su
 **Store Interface (`store.go`)** - Defines the contract for DLQ persistence:
 - `Store(msg)` - Add a failed message
 - `Get(id)` - Retrieve a message by ID
+- `GetByOriginalID(originalID)` - Retrieve a message by the original event message ID (`ErrNotFound` if absent)
 - `List(filter)` - Query messages with filtering
 - `Count(filter)` - Count matching messages
 - `MarkRetried(id)` - Mark message as replayed
@@ -36,6 +37,8 @@ Dead Letter Queue (DLQ) package for the `github.com/rbaliyan/event` event pub-su
 - `ReplaySingle()` - Replay a single message by ID
 - `Cleanup()` - Remove old messages
 - `Stats()` - Get DLQ statistics
+
+**StoreAdapter (`adapter.go`)** - Bridges a `Store` to the event bus. `NewStoreAdapter(store, source)` returns an adapter implementing the `event.DLQStore` interface; pass it to `event.WithDLQ(...)` so the bus auto-captures messages that exhaust their retries (generating the DLQ ID and tagging each with `source`). This is the primary production wiring path — see `examples/main.go`.
 
 **Store Implementations:**
 - `MemoryStore` (`memory.go`) - Thread-safe in-memory store for testing
@@ -96,10 +99,9 @@ type Stats struct {
 
 **Optional Interface**: `Quarantiner` for stores that support terminal-message quarantine — `Quarantine(ctx, id) error`; detected via type assertion (same pattern as `StatsProvider`); all four built-in stores implement it
 
-**Builder Pattern**: Store constructors return self for method chaining:
+**Functional Options**: Store constructors take variadic options and (except `NewMemoryStore`) return an error:
 ```go
-store := dlq.NewMongoStore(db).
-    WithCollection("custom_dlq")
+store, err := dlq.NewMongoStore(db, dlq.WithCollection("custom_dlq"))
 ```
 
 **Replay Metadata**: Replayed messages include DLQ metadata:

@@ -672,19 +672,31 @@ func (s *RedisStore) Stats(ctx context.Context) (*Stats, error) {
 		MessagesByError: make(map[string]int64),
 	}
 
-	total, _ := s.client.ZCard(ctx, s.timeKey).Result()
+	total, err := s.client.ZCard(ctx, s.timeKey).Result()
+	if err != nil {
+		return nil, fmt.Errorf("stats: total count: %w", err)
+	}
 	stats.TotalMessages = total
 
-	retried, _ := s.client.SCard(ctx, s.retriedKey).Result()
+	retried, err := s.client.SCard(ctx, s.retriedKey).Result()
+	if err != nil {
+		return nil, fmt.Errorf("stats: retried count: %w", err)
+	}
 	stats.RetriedMessages = retried
 
-	quarantined, _ := s.client.SCard(ctx, s.quarantinedKey).Result()
+	quarantined, err := s.client.SCard(ctx, s.quarantinedKey).Result()
+	if err != nil {
+		return nil, fmt.Errorf("stats: quarantined count: %w", err)
+	}
 	stats.QuarantinedMessages = quarantined
 
 	// Pending = total - |retried ∪ quarantined|: a message is pending iff it is
 	// neither retried nor quarantined. Computing the union cardinality avoids
 	// double-counting messages that are in both sets.
-	unionMembers, _ := s.client.SUnion(ctx, s.retriedKey, s.quarantinedKey).Result()
+	unionMembers, err := s.client.SUnion(ctx, s.retriedKey, s.quarantinedKey).Result()
+	if err != nil {
+		return nil, fmt.Errorf("stats: union of retried and quarantined: %w", err)
+	}
 	nonPending := int64(len(unionMembers))
 	if pending := total - nonPending; pending > 0 {
 		stats.PendingMessages = pending
@@ -695,11 +707,14 @@ func (s *RedisStore) Stats(ctx context.Context) (*Stats, error) {
 	for {
 		keys, nextCursor, err := s.client.Scan(ctx, cursor, s.eventPrefix+"*", 100).Result()
 		if err != nil {
-			break
+			return nil, fmt.Errorf("stats: scan event keys: %w", err)
 		}
 		for _, key := range keys {
 			eventName := key[len(s.eventPrefix):]
-			count, _ := s.client.ZCard(ctx, key).Result()
+			count, err := s.client.ZCard(ctx, key).Result()
+			if err != nil {
+				return nil, fmt.Errorf("stats: count for event %q: %w", eventName, err)
+			}
 			stats.MessagesByEvent[eventName] = count
 		}
 		cursor = nextCursor

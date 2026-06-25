@@ -28,8 +28,11 @@ import (
 //
 // Example:
 //
-//	store := dlq.NewPostgresStore(db)
-//	manager, err := dlq.NewManager(store, transport)
+//	store, err := dlq.NewPostgresStore(db)
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
+//	manager, err := dlq.NewManager(store, bus)
 //	if err != nil {
 //	    log.Fatal(err)
 //	}
@@ -163,7 +166,7 @@ func WithLogger(l *slog.Logger) ManagerOption {
 // Example:
 //
 //	metrics, _ := dlq.NewMetrics()
-//	manager, err := dlq.NewManager(store, transport, dlq.WithMetrics(metrics))
+//	manager, err := dlq.NewManager(store, bus, dlq.WithMetrics(metrics))
 //	if err != nil {
 //	    log.Fatal(err)
 //	}
@@ -186,7 +189,7 @@ func WithMetrics(m *Metrics) ManagerOption {
 //	// Using the event library's backoff package
 //	import "github.com/rbaliyan/event/v3/backoff"
 //
-//	manager, err := dlq.NewManager(store, transport,
+//	manager, err := dlq.NewManager(store, bus,
 //	    dlq.WithBackoff(&backoff.Exponential{
 //	        Initial:    time.Second,
 //	        Multiplier: 2.0,
@@ -214,7 +217,7 @@ func WithBackoff(strategy BackoffStrategy) ManagerOption {
 //
 // Example:
 //
-//	manager, err := dlq.NewManager(store, transport,
+//	manager, err := dlq.NewManager(store, bus,
 //	    dlq.WithBackoff(backoffStrategy),
 //	    dlq.WithMaxRetries(3),
 //	)
@@ -314,7 +317,10 @@ func TerminalErrorMatching(patterns ...string) func(*Message) bool {
 //
 // Example:
 //
-//	store := dlq.NewRedisStore(redisClient)
+//	store, err := dlq.NewRedisStore(redisClient)
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
 //
 //	// Using a bus (recommended for MongoDB and other non-publishable transports)
 //	manager, err := dlq.NewManager(store, bus)

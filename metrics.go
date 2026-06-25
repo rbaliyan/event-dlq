@@ -46,8 +46,11 @@ type Metrics struct {
 //
 // Example:
 //
-//	metrics := dlq.NewMetrics()
-//	manager := dlq.NewManager(store, transport, dlq.WithMetrics(metrics))
+//	metrics, err := dlq.NewMetrics()
+//	if err != nil {
+//		return err
+//	}
+//	manager, err := dlq.NewManager(store, bus, dlq.WithMetrics(metrics))
 func NewMetrics() (*Metrics, error) {
 	return NewMetricsWithProvider(otel.GetMeterProvider())
 }
@@ -232,7 +235,10 @@ func (m *Metrics) RecordReplayFailure(ctx context.Context, eventName, errorType 
 }
 
 // RecordQuarantined records that a terminal message was quarantined.
-// Increments dlq_messages_quarantined_total.
+// Increments dlq_messages_quarantined_total and decrements dlq_messages_pending,
+// because every backend's Stats.PendingMessages excludes quarantined messages:
+// a quarantined message leaves the pending pool just as a replayed or deleted one
+// does, so the gauge must drop by one to stay consistent with Stats.
 func (m *Metrics) RecordQuarantined(ctx context.Context, eventName string) {
 	if m == nil {
 		return
@@ -243,6 +249,13 @@ func (m *Metrics) RecordQuarantined(ctx context.Context, eventName string) {
 	}
 
 	m.messagesQuarantinedTotal.Add(ctx, 1, metric.WithAttributes(attrs...))
+	m.messagesPending.Add(ctx, -1, metric.WithAttributes(attrs...))
+
+	m.pendingMu.Lock()
+	if m.pendingCounts[eventName] > 0 {
+		m.pendingCounts[eventName]--
+	}
+	m.pendingMu.Unlock()
 }
 
 // SyncPendingCount synchronizes the pending count for an event.

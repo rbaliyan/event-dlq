@@ -112,3 +112,70 @@ func TestRecordQuarantinedNilSafe(t *testing.T) {
 	// Must not panic.
 	m.RecordQuarantined(context.Background(), "order.process")
 }
+
+// TestNewMetrics_GlobalProvider covers the global-provider constructor.
+func TestNewMetrics_GlobalProvider(t *testing.T) {
+	m, err := NewMetrics()
+	if err != nil {
+		t.Fatalf("NewMetrics: %v", err)
+	}
+	if m == nil {
+		t.Fatal("NewMetrics returned nil")
+	}
+}
+
+// TestMetrics_SyncPendingCount adjusts the pending gauge by the delta between the
+// old and new counts for an event.
+func TestMetrics_SyncPendingCount(t *testing.T) {
+	ctx := context.Background()
+	m, reader := newTestMetrics(t)
+
+	m.SyncPendingCount(ctx, "order.process", 7)
+	if got := readPending(t, reader); got != 7 {
+		t.Fatalf("after sync to 7, gauge = %d, want 7", got)
+	}
+	// Re-syncing to a lower value applies the negative delta.
+	m.SyncPendingCount(ctx, "order.process", 2)
+	if got := readPending(t, reader); got != 2 {
+		t.Fatalf("after re-sync to 2, gauge = %d, want 2", got)
+	}
+	// A no-op sync (same value) must not change the gauge.
+	m.SyncPendingCount(ctx, "order.process", 2)
+	if got := readPending(t, reader); got != 2 {
+		t.Fatalf("after no-op sync, gauge = %d, want 2", got)
+	}
+}
+
+// TestRecordReplaySuccessFailure_NilAndReal covers both receiver branches of the
+// replay success/failure recorders.
+func TestRecordReplaySuccessFailure_NilAndReal(t *testing.T) {
+	ctx := context.Background()
+
+	var nilMetrics *Metrics
+	// Nil receiver must be a no-op, not a panic.
+	nilMetrics.RecordReplaySuccess(ctx, "e")
+	nilMetrics.RecordReplayFailure(ctx, "e", "boom")
+
+	m, _ := newTestMetrics(t)
+	// Real receiver path (no panic, records emitted).
+	m.RecordReplaySuccess(ctx, "e")
+	m.RecordReplayFailure(ctx, "e", "boom: detail")
+}
+
+// TestWithMetrics_EnablesRecording wires a Metrics through the manager option and
+// confirms a stored message moves the pending gauge (covering WithMetrics).
+func TestWithMetrics_EnablesRecording(t *testing.T) {
+	ctx := context.Background()
+	m, reader := newTestMetrics(t)
+
+	mgr, err := NewManager(NewMemoryStore(), &countingRepublisher{}, WithMetrics(m))
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	if err := mgr.Store(ctx, StoreParams{EventName: "order.process", OriginalID: "o1"}); err != nil {
+		t.Fatalf("Store: %v", err)
+	}
+	if got := readPending(t, reader); got != 1 {
+		t.Fatalf("pending gauge after Store via manager = %d, want 1", got)
+	}
+}

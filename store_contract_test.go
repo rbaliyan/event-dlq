@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
+	"github.com/rbaliyan/event/v3/health"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -232,6 +233,36 @@ func runStoreContractTests(t *testing.T, store Store) {
 		assert.Equal(t, int64(len(results)), count)
 	})
 
+	t.Run("Stats/SeedTotals", func(t *testing.T) {
+		sp, ok := store.(StatsProvider)
+		if !ok {
+			t.Skip("store does not implement StatsProvider")
+		}
+		stats, err := sp.Stats(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, int64(6), stats.TotalMessages)
+		assert.Equal(t, int64(1), stats.RetriedMessages, "only c-6 is retried")
+		// PendingMessages excludes retried and quarantined; nothing is
+		// quarantined at this point, so 6 - 1 retried = 5.
+		assert.Equal(t, int64(5), stats.PendingMessages)
+		assert.Equal(t, int64(0), stats.QuarantinedMessages)
+		assert.Equal(t, int64(3), stats.MessagesByEvent["order.created"])
+		assert.Equal(t, int64(2), stats.MessagesByEvent["order.updated"])
+		assert.Equal(t, int64(1), stats.MessagesByEvent["payment.failed"])
+	})
+
+	t.Run("Health/ReachableStoreIsNotUnhealthy", func(t *testing.T) {
+		hc, ok := store.(health.Checker)
+		if !ok {
+			t.Skip("store does not implement health.Checker")
+		}
+		res := hc.Health(ctx)
+		require.NotNil(t, res)
+		assert.NotEqual(t, health.StatusUnhealthy, res.Status,
+			"a reachable store must not report unhealthy")
+		assert.False(t, res.CheckedAt.IsZero(), "CheckedAt must be set")
+	})
+
 	// Destructive tests below — each manages its own temporary data.
 
 	t.Run("MarkRetried/SetsField", func(t *testing.T) {
@@ -351,5 +382,29 @@ func runStoreContractTests(t *testing.T, store Store) {
 		// Recent messages survive
 		_, err = store.Get(ctx, "c-5")
 		require.NoError(t, err)
+	})
+
+	t.Run("DeleteByFilter/RemovesMatchingOnly", func(t *testing.T) {
+		const evt = "delbyfilter.evt"
+		for _, id := range []string{"dbf-1", "dbf-2"} {
+			require.NoError(t, store.Store(ctx, &Message{
+				ID: id, EventName: evt, OriginalID: "orig-" + id,
+				Payload: []byte("{}"), Error: "e", CreatedAt: base,
+			}))
+		}
+
+		deleted, err := store.DeleteByFilter(ctx, Filter{EventName: evt})
+		require.NoError(t, err)
+		assert.Equal(t, int64(2), deleted)
+
+		// The matching event is now empty...
+		remaining, err := store.Count(ctx, Filter{EventName: evt})
+		require.NoError(t, err)
+		assert.Equal(t, int64(0), remaining)
+
+		// ...and the seed is untouched.
+		total, err := store.Count(ctx, Filter{})
+		require.NoError(t, err)
+		assert.Equal(t, int64(6), total)
 	})
 }

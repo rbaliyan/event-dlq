@@ -18,6 +18,10 @@ test-v:
 test-race:
     go test -race ./...
 
+# Run fast hermetic smoke tests (critical-path sanity, no external services)
+smoke:
+    go test -run 'TestSmoke|Contract' -race ./...
+
 # Run tests with coverage
 test-cover:
     go test -cover ./...

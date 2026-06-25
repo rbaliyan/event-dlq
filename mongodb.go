@@ -783,6 +783,9 @@ func (s *MongoStore) GetByOriginalID(ctx context.Context, originalID string) (*M
 // Health performs a health check by pinging the MongoDB database and counting documents.
 // Returns healthy if both the ping and count succeed, unhealthy otherwise.
 // The result includes message_count in details, matching RedisStore and PostgresStore.
+// Backend returns the store's backend name for metric labelling.
+func (s *MongoStore) Backend() string { return "mongo" }
+
 func (s *MongoStore) Health(ctx context.Context) *health.Result {
 	start := time.Now()
 

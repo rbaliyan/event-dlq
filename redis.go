@@ -739,6 +739,9 @@ func (s *RedisStore) GetByOriginalID(ctx context.Context, originalID string) (*M
 }
 
 // Health performs a health check by pinging the Redis server.
+// Backend returns the store's backend name for metric labelling.
+func (s *RedisStore) Backend() string { return "redis" }
+
 func (s *RedisStore) Health(ctx context.Context) *health.Result {
 	start := time.Now()
 

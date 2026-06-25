@@ -3,6 +3,7 @@ package dlq
 import (
 	"context"
 	"testing"
+	"time"
 
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
@@ -32,6 +33,63 @@ func readPending(t *testing.T, reader sdkmetric.Reader) int64 {
 				total += dp.Value
 			}
 			return total
+		}
+	}
+	return 0
+}
+
+// sumInt64 returns the summed value of an Int64 counter/up-down gauge by name.
+func sumInt64(t *testing.T, reader sdkmetric.Reader, name string) int64 {
+	t.Helper()
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("collect metrics: %v", err)
+	}
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != name {
+				continue
+			}
+			sum, ok := m.Data.(metricdata.Sum[int64])
+			if !ok {
+				t.Fatalf("%s has unexpected data type %T", name, m.Data)
+			}
+			var total int64
+			for _, dp := range sum.DataPoints {
+				total += dp.Value
+			}
+			return total
+		}
+	}
+	return 0
+}
+
+// histogramCount returns the total number of recorded samples for a histogram.
+func histogramCount(t *testing.T, reader sdkmetric.Reader, name string) uint64 {
+	t.Helper()
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("collect metrics: %v", err)
+	}
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != name {
+				continue
+			}
+			var count uint64
+			switch h := m.Data.(type) {
+			case metricdata.Histogram[float64]:
+				for _, dp := range h.DataPoints {
+					count += dp.Count
+				}
+			case metricdata.Histogram[int64]:
+				for _, dp := range h.DataPoints {
+					count += dp.Count
+				}
+			default:
+				t.Fatalf("%s has unexpected data type %T", name, m.Data)
+			}
+			return count
 		}
 	}
 	return 0
@@ -68,7 +126,7 @@ func TestRecordQuarantinedDecrementsPending(t *testing.T) {
 		t.Fatalf("pending gauge after store = %d, want 1", got)
 	}
 
-	m.RecordQuarantined(ctx, "order.process")
+	m.RecordQuarantined(ctx, "order.process", "terminal_error")
 	if got := readPending(t, reader); got != 0 {
 		t.Fatalf("pending gauge after quarantine = %d, want 0 (quarantine must leave the pending pool)", got)
 	}
@@ -98,7 +156,7 @@ func TestRecordQuarantinedGaugeMatchesReplayAndDelete(t *testing.T) {
 
 	m.RecordMessageReplayed(ctx, "order.process")
 	m.RecordMessageDeleted(ctx, "order.process")
-	m.RecordQuarantined(ctx, "order.process")
+	m.RecordQuarantined(ctx, "order.process", "max_replay_attempts")
 
 	if got := readPending(t, reader); got != 0 {
 		t.Fatalf("pending gauge after replay+delete+quarantine = %d, want 0", got)
@@ -110,7 +168,7 @@ func TestRecordQuarantinedGaugeMatchesReplayAndDelete(t *testing.T) {
 func TestRecordQuarantinedNilSafe(t *testing.T) {
 	var m *Metrics
 	// Must not panic.
-	m.RecordQuarantined(context.Background(), "order.process")
+	m.RecordQuarantined(context.Background(), "order.process", "terminal_error")
 }
 
 // TestNewMetrics_GlobalProvider covers the global-provider constructor.
@@ -178,4 +236,69 @@ func TestWithMetrics_EnablesRecording(t *testing.T) {
 	if got := readPending(t, reader); got != 1 {
 		t.Fatalf("pending gauge after Store via manager = %d, want 1", got)
 	}
+}
+
+// TestRecordStoreError records the store-error counter with op/backend labels.
+func TestRecordStoreError(t *testing.T) {
+	ctx := context.Background()
+	m, reader := newTestMetrics(t)
+
+	m.RecordStoreError(ctx, "store", "postgres")
+	m.RecordStoreError(ctx, "list", "redis")
+	if got := sumInt64(t, reader, "dlq_store_errors_total"); got != 2 {
+		t.Fatalf("dlq_store_errors_total = %d, want 2", got)
+	}
+}
+
+// TestRecordQuarantinedRaisesQuarantinedGauge verifies the current-quarantined
+// gauge rises on quarantine (and the quarantined_total counter increments).
+func TestRecordQuarantinedRaisesQuarantinedGauge(t *testing.T) {
+	ctx := context.Background()
+	m, reader := newTestMetrics(t)
+
+	m.RecordMessageStored(ctx, "order.process", "boom")
+	m.RecordQuarantined(ctx, "order.process", "max_replay_attempts")
+
+	if got := sumInt64(t, reader, "dlq_messages_quarantined"); got != 1 {
+		t.Fatalf("dlq_messages_quarantined gauge = %d, want 1", got)
+	}
+	if got := sumInt64(t, reader, "dlq_messages_quarantined_total"); got != 1 {
+		t.Fatalf("dlq_messages_quarantined_total = %d, want 1", got)
+	}
+	if got := readPending(t, reader); got != 0 {
+		t.Fatalf("pending gauge after store+quarantine = %d, want 0", got)
+	}
+}
+
+// TestReplayAndAgeHistogramsRecorded confirms the duration, attempts, and age
+// histograms receive samples.
+func TestReplayAndAgeHistogramsRecorded(t *testing.T) {
+	ctx := context.Background()
+	m, reader := newTestMetrics(t)
+
+	m.RecordReplayDuration(ctx, "e", 12*time.Millisecond)
+	m.RecordReplayAttempts(ctx, "e", 2)
+	m.RecordMessageAge(ctx, "e", time.Now().Add(-time.Hour))
+	// A zero CreatedAt must be ignored (no sample).
+	m.RecordMessageAge(ctx, "e", time.Time{})
+
+	if got := histogramCount(t, reader, "dlq_replay_duration_seconds"); got != 1 {
+		t.Fatalf("dlq_replay_duration_seconds count = %d, want 1", got)
+	}
+	if got := histogramCount(t, reader, "dlq_replay_attempts"); got != 1 {
+		t.Fatalf("dlq_replay_attempts count = %d, want 1", got)
+	}
+	if got := histogramCount(t, reader, "dlq_message_age_seconds"); got != 1 {
+		t.Fatalf("dlq_message_age_seconds count = %d, want 1 (zero CreatedAt ignored)", got)
+	}
+}
+
+// TestNewRecordersNilSafe verifies the new Record methods are nil-receiver safe.
+func TestNewRecordersNilSafe(t *testing.T) {
+	var m *Metrics
+	ctx := context.Background()
+	m.RecordStoreError(ctx, "store", "memory")
+	m.RecordReplayDuration(ctx, "e", time.Second)
+	m.RecordReplayAttempts(ctx, "e", 1)
+	m.RecordMessageAge(ctx, "e", time.Now())
 }

@@ -395,6 +395,15 @@ func NewManagerWithTransport(store Store, t transport.Transport, opts ...Manager
 //	        Source:     "order-service",
 //	    })
 //	}
+// backend returns the underlying store's backend name for metric labelling, or
+// "unknown" if the store does not expose one.
+func (m *Manager) backend() string {
+	if b, ok := m.store.(interface{ Backend() string }); ok {
+		return b.Backend()
+	}
+	return "unknown"
+}
+
 func (m *Manager) Store(ctx context.Context, params StoreParams) error {
 	var errMsg string
 	if params.Err != nil {
@@ -415,6 +424,7 @@ func (m *Manager) Store(ctx context.Context, params StoreParams) error {
 	}
 
 	if storeErr := m.store.Store(ctx, msg); storeErr != nil {
+		m.metrics.RecordStoreError(ctx, "store", m.backend())
 		m.logger.Error("failed to store DLQ message",
 			"event", params.EventName,
 			"original_id", params.OriginalID,
@@ -487,6 +497,7 @@ func (m *Manager) Replay(ctx context.Context, filter Filter) (int, error) {
 	filter.ExcludeQuarantined = true // never re-evaluate quarantined messages
 	messages, err := m.store.List(ctx, filter)
 	if err != nil {
+		m.metrics.RecordStoreError(ctx, "list", m.backend())
 		return 0, fmt.Errorf("list messages: %w", err)
 	}
 
@@ -515,6 +526,7 @@ func (m *Manager) Replay(ctx context.Context, filter Filter) (int, error) {
 		}
 
 		if err := m.store.MarkRetried(ctx, msg.ID); err != nil {
+			m.metrics.RecordStoreError(ctx, "mark_retried", m.backend())
 			m.logger.Error("failed to mark message as retried",
 				"id", msg.ID,
 				"error", err)
@@ -523,6 +535,7 @@ func (m *Manager) Replay(ctx context.Context, filter Filter) (int, error) {
 		// Record replay success metrics
 		m.metrics.RecordReplaySuccess(ctx, msg.EventName)
 		m.metrics.RecordMessageReplayed(ctx, msg.EventName)
+		m.metrics.RecordMessageAge(ctx, msg.EventName, msg.CreatedAt)
 
 		replayed++
 	}
@@ -555,7 +568,8 @@ func (m *Manager) quarantineMessage(ctx context.Context, msg *Message, reason st
 	if err := q.Quarantine(ctx, msg.ID); err != nil {
 		return fmt.Errorf("quarantine %s: %w", msg.ID, err)
 	}
-	m.metrics.RecordQuarantined(ctx, msg.EventName)
+	m.metrics.RecordQuarantined(ctx, msg.EventName, reason)
+	m.metrics.RecordMessageAge(ctx, msg.EventName, msg.CreatedAt)
 	m.logger.Info("quarantined DLQ message instead of replaying",
 		"id", msg.ID, "event", msg.EventName, "reason", reason, "error", msg.Error)
 	return nil
@@ -585,6 +599,7 @@ func (m *Manager) quarantineDuringReplay(ctx context.Context, msg *Message, reas
 func (m *Manager) ReplaySingle(ctx context.Context, id string) error {
 	msg, err := m.store.Get(ctx, id)
 	if err != nil {
+		m.metrics.RecordStoreError(ctx, "get", m.backend())
 		return fmt.Errorf("get message: %w", err)
 	}
 
@@ -602,12 +617,14 @@ func (m *Manager) ReplaySingle(ctx context.Context, id string) error {
 	}
 
 	if err := m.store.MarkRetried(ctx, id); err != nil {
+		m.metrics.RecordStoreError(ctx, "mark_retried", m.backend())
 		return fmt.Errorf("mark retried: %w", err)
 	}
 
 	// Record replay success metrics
 	m.metrics.RecordReplaySuccess(ctx, msg.EventName)
 	m.metrics.RecordMessageReplayed(ctx, msg.EventName)
+	m.metrics.RecordMessageAge(ctx, msg.EventName, msg.CreatedAt)
 
 	m.logger.Info("replayed single DLQ message",
 		"id", id,
@@ -626,8 +643,18 @@ func (m *Manager) replayMessageWithRetry(ctx context.Context, msg *Message) erro
 		maxAttempts = 1
 	}
 
+	// Record the (retry-inclusive) duration and the attempt count on every exit
+	// path — success, give-up, or context cancellation.
+	start := time.Now()
+	attemptsMade := 0
+	defer func() {
+		m.metrics.RecordReplayDuration(ctx, msg.EventName, time.Since(start))
+		m.metrics.RecordReplayAttempts(ctx, msg.EventName, attemptsMade)
+	}()
+
 	var lastErr error
 	for attempt := 0; attempt < maxAttempts; attempt++ {
+		attemptsMade = attempt + 1
 		// Wait for backoff delay on retry (not on first attempt)
 		if attempt > 0 && m.backoff != nil {
 			backoffDelay := m.backoff.NextDelay(attempt - 1)
@@ -688,15 +715,18 @@ func (m *Manager) Delete(ctx context.Context, id string) error {
 	// Get message first to record metrics with event name
 	msg, err := m.store.Get(ctx, id)
 	if err != nil {
+		m.metrics.RecordStoreError(ctx, "get", m.backend())
 		return err
 	}
 
 	if err := m.store.Delete(ctx, id); err != nil {
+		m.metrics.RecordStoreError(ctx, "delete", m.backend())
 		return err
 	}
 
 	// Record delete metric
 	m.metrics.RecordMessageDeleted(ctx, msg.EventName)
+	m.metrics.RecordMessageAge(ctx, msg.EventName, msg.CreatedAt)
 	return nil
 }
 
@@ -704,6 +734,7 @@ func (m *Manager) Delete(ctx context.Context, id string) error {
 func (m *Manager) DeleteByFilter(ctx context.Context, filter Filter) (int64, error) {
 	deleted, err := m.store.DeleteByFilter(ctx, filter)
 	if err != nil {
+		m.metrics.RecordStoreError(ctx, "delete_by_filter", m.backend())
 		return 0, err
 	}
 
@@ -716,6 +747,7 @@ func (m *Manager) DeleteByFilter(ctx context.Context, filter Filter) (int64, err
 func (m *Manager) Cleanup(ctx context.Context, age time.Duration) (int64, error) {
 	deleted, err := m.store.DeleteOlderThan(ctx, age)
 	if err != nil {
+		m.metrics.RecordStoreError(ctx, "delete_older_than", m.backend())
 		return 0, err
 	}
 

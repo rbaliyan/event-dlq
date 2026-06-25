@@ -3,6 +3,7 @@ package dlq
 import (
 	"context"
 	"sync"
+	"time"
 	"unicode/utf8"
 
 	"go.opentelemetry.io/otel"
@@ -27,8 +28,13 @@ const (
 //   - dlq_messages_deleted_total: Counter of messages deleted/cleaned up
 //   - dlq_messages_pending: Gauge of current pending messages in DLQ
 //   - dlq_replay_success_total: Counter of successful replays
-//   - dlq_replay_failure_total: Counter of failed replays
-//   - dlq_messages_quarantined_total: Counter of messages quarantined as terminal/non-retryable
+//   - dlq_replay_failure_total: Counter of failed replays (by event, error_type)
+//   - dlq_messages_quarantined_total: Counter of quarantines (by event, reason)
+//   - dlq_messages_quarantined: Gauge of currently-quarantined messages
+//   - dlq_store_errors_total: Counter of store operation failures (by op, backend)
+//   - dlq_replay_duration_seconds: Histogram of replay attempt duration
+//   - dlq_replay_attempts: Histogram of attempts per replay
+//   - dlq_message_age_seconds: Histogram of message age when it leaves the DLQ
 type Metrics struct {
 	messagesTotal            metric.Int64Counter
 	messagesReplayedTotal    metric.Int64Counter
@@ -37,6 +43,11 @@ type Metrics struct {
 	replaySuccessTotal       metric.Int64Counter
 	replayFailureTotal       metric.Int64Counter
 	messagesQuarantinedTotal metric.Int64Counter
+	messagesQuarantined      metric.Int64UpDownCounter
+	storeErrorsTotal         metric.Int64Counter
+	replayDuration           metric.Float64Histogram
+	replayAttempts           metric.Int64Histogram
+	messageAge               metric.Float64Histogram
 
 	// pendingCounts tracks pending messages per event for gauge updates
 	pendingMu     sync.RWMutex
@@ -123,6 +134,49 @@ func NewMetricsWithProvider(provider metric.MeterProvider) (*Metrics, error) {
 		return nil, err
 	}
 
+	messagesQuarantined, err := meter.Int64UpDownCounter("dlq_messages_quarantined",
+		metric.WithDescription("Current number of quarantined messages in the DLQ"),
+		metric.WithUnit("{message}"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	storeErrorsTotal, err := meter.Int64Counter("dlq_store_errors_total",
+		metric.WithDescription("Total DLQ store operation failures, by operation and backend"),
+		metric.WithUnit("{error}"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	replayDuration, err := meter.Float64Histogram("dlq_replay_duration_seconds",
+		metric.WithDescription("Duration of a message replay attempt (retry-inclusive)"),
+		metric.WithUnit("s"),
+		metric.WithExplicitBucketBoundaries(0.005, 0.01, 0.05, 0.1, 0.5, 1, 5, 30),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	replayAttempts, err := meter.Int64Histogram("dlq_replay_attempts",
+		metric.WithDescription("Number of attempts made to replay a message before success or failure"),
+		metric.WithUnit("{attempt}"),
+		metric.WithExplicitBucketBoundaries(1, 2, 3, 5, 10),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	messageAge, err := meter.Float64Histogram("dlq_message_age_seconds",
+		metric.WithDescription("Age of a message (time since CreatedAt) when it leaves the DLQ"),
+		metric.WithUnit("s"),
+		metric.WithExplicitBucketBoundaries(60, 300, 3600, 21600, 86400, 604800),
+	)
+	if err != nil {
+		return nil, err
+	}
+
 	return &Metrics{
 		messagesTotal:            messagesTotal,
 		messagesReplayedTotal:    messagesReplayedTotal,
@@ -131,6 +185,11 @@ func NewMetricsWithProvider(provider metric.MeterProvider) (*Metrics, error) {
 		replaySuccessTotal:       replaySuccessTotal,
 		replayFailureTotal:       replayFailureTotal,
 		messagesQuarantinedTotal: messagesQuarantinedTotal,
+		messagesQuarantined:      messagesQuarantined,
+		storeErrorsTotal:         storeErrorsTotal,
+		replayDuration:           replayDuration,
+		replayAttempts:           replayAttempts,
+		messageAge:               messageAge,
 		pendingCounts:            make(map[string]int64),
 	}, nil
 }
@@ -240,23 +299,73 @@ func (m *Metrics) RecordReplayFailure(ctx context.Context, eventName, errorType 
 // because every backend's Stats.PendingMessages excludes quarantined messages:
 // a quarantined message leaves the pending pool just as a replayed or deleted one
 // does, so the gauge must drop by one to stay consistent with Stats.
-func (m *Metrics) RecordQuarantined(ctx context.Context, eventName string) {
+// The reason is a bounded enum (max_replay_attempts / terminal_error), so it is
+// safe to use as a label.
+func (m *Metrics) RecordQuarantined(ctx context.Context, eventName, reason string) {
 	if m == nil {
 		return
 	}
 
-	attrs := []attribute.KeyValue{
-		attribute.String("event", eventName),
-	}
+	eventAttr := metric.WithAttributes(attribute.String("event", eventName))
 
-	m.messagesQuarantinedTotal.Add(ctx, 1, metric.WithAttributes(attrs...))
-	m.messagesPending.Add(ctx, -1, metric.WithAttributes(attrs...))
+	m.messagesQuarantinedTotal.Add(ctx, 1, metric.WithAttributes(
+		attribute.String("event", eventName),
+		attribute.String("reason", reason),
+	))
+	// A quarantined message leaves the pending pool and enters the quarantined
+	// pool: drop the pending gauge and raise the quarantined gauge.
+	m.messagesPending.Add(ctx, -1, eventAttr)
+	m.messagesQuarantined.Add(ctx, 1, eventAttr)
 
 	m.pendingMu.Lock()
 	if m.pendingCounts[eventName] > 0 {
 		m.pendingCounts[eventName]--
 	}
 	m.pendingMu.Unlock()
+}
+
+// RecordReplayDuration records how long a (retry-inclusive) replay attempt took.
+func (m *Metrics) RecordReplayDuration(ctx context.Context, eventName string, d time.Duration) {
+	if m == nil {
+		return
+	}
+	m.replayDuration.Record(ctx, d.Seconds(), metric.WithAttributes(attribute.String("event", eventName)))
+}
+
+// RecordReplayAttempts records how many attempts a replay took before it
+// succeeded or gave up.
+func (m *Metrics) RecordReplayAttempts(ctx context.Context, eventName string, attempts int) {
+	if m == nil {
+		return
+	}
+	m.replayAttempts.Record(ctx, int64(attempts), metric.WithAttributes(attribute.String("event", eventName)))
+}
+
+// RecordMessageAge records how long a message lived in the DLQ (now - createdAt)
+// at the moment it leaves — replayed, deleted, or quarantined. This is the
+// "time in DLQ" signal operators alert on. A zero createdAt is ignored.
+func (m *Metrics) RecordMessageAge(ctx context.Context, eventName string, createdAt time.Time) {
+	if m == nil || createdAt.IsZero() {
+		return
+	}
+	age := time.Since(createdAt).Seconds()
+	if age < 0 {
+		age = 0
+	}
+	m.messageAge.Record(ctx, age, metric.WithAttributes(attribute.String("event", eventName)))
+}
+
+// RecordStoreError records a failure of a backend store operation, labelled by
+// operation and backend so a broken DLQ persistence layer is alertable. Both
+// labels are bounded enums.
+func (m *Metrics) RecordStoreError(ctx context.Context, op, backend string) {
+	if m == nil {
+		return
+	}
+	m.storeErrorsTotal.Add(ctx, 1, metric.WithAttributes(
+		attribute.String("op", op),
+		attribute.String("backend", backend),
+	))
 }
 
 // SyncPendingCount synchronizes the pending count for an event.

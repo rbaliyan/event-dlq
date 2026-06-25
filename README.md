@@ -380,7 +380,7 @@ dlq.WithTerminalError(func(msg *dlq.Message) bool {
 - Quarantine requires the store to implement the optional `Quarantiner` interface (all four built-in stores do). If the store does not implement `Quarantiner`, the message is skipped with a warning instead of being republished.
 - `Replay` always sets `Filter.ExcludeQuarantined = true` internally, so quarantined messages are never re-evaluated on subsequent sweeps.
 - `Stats.QuarantinedMessages` counts quarantined messages; `Stats.PendingMessages` excludes them.
-- The OTel counter `dlq_messages_quarantined_total{event}` increments on each quarantine.
+- The OTel counter `dlq_messages_quarantined_total{event,reason}` increments on each quarantine (`reason` is `max_replay_attempts` or `terminal_error`), and the `dlq_messages_quarantined` gauge tracks the current quarantined count.
 - `Quarantine(ctx, id)` (and replaying a terminal message by ID via `ReplaySingle`) returns `ErrNotFound` if no message with that ID exists.
 
 ### Capping replay attempts (error-agnostic loop guard)

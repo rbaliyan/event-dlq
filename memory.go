@@ -365,6 +365,9 @@ func (s *MemoryStore) GetByOriginalID(ctx context.Context, originalID string) (*
 
 // Health performs a health check on the in-memory store.
 // Always returns healthy with the current message count.
+// Backend returns the store's backend name for metric labelling.
+func (s *MemoryStore) Backend() string { return "memory" }
+
 func (s *MemoryStore) Health(ctx context.Context) *health.Result {
 	s.mu.RLock()
 	count := len(s.messages)

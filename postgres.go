@@ -642,6 +642,9 @@ func (s *PostgresStore) GetByOriginalID(ctx context.Context, originalID string) 
 
 // Health performs a health check by pinging the PostgreSQL database.
 // Returns healthy if the ping succeeds, unhealthy otherwise.
+// Backend returns the store's backend name for metric labelling.
+func (s *PostgresStore) Backend() string { return "postgres" }
+
 func (s *PostgresStore) Health(ctx context.Context) *health.Result {
 	start := time.Now()
 

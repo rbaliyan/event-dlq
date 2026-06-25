@@ -439,6 +439,13 @@ func (m *Manager) Get(ctx context.Context, id string) (*Message, error) {
 	return m.store.Get(ctx, id)
 }
 
+// GetByOriginalID retrieves a single DLQ message by the original event message
+// ID (the ID of the message that originally failed), rather than by the
+// generated DLQ ID. Returns ErrNotFound if no message has that original ID.
+func (m *Manager) GetByOriginalID(ctx context.Context, originalID string) (*Message, error) {
+	return m.store.GetByOriginalID(ctx, originalID)
+}
+
 // List returns DLQ messages matching the filter
 func (m *Manager) List(ctx context.Context, filter Filter) ([]*Message, error) {
 	return m.store.List(ctx, filter)

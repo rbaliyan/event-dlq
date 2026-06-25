@@ -435,10 +435,23 @@ func (s *MongoStore) upsertDedup(ctx context.Context, msg *Message) error {
 		}}},
 	}
 	opts := options.UpdateOne().SetUpsert(true)
-	if _, err := s.collection.UpdateOne(ctx, filter, mongo.Pipeline(pipeline), opts); err != nil {
-		return fmt.Errorf("upsert dedup: %w", err)
+	// Concurrent upserts of the same (event_name, original_id) race to insert
+	// before the document exists; MongoDB lets only one insert win and fails the
+	// rest with a duplicate-key error (E11000). Retry on that error: once any
+	// inserter wins, the document exists and the retry takes the increment path.
+	// A single retry is sufficient in principle (the doc exists after the first
+	// round); the small bound guards against repeated contention.
+	const maxAttempts = 3
+	var err error
+	for range maxAttempts {
+		if _, err = s.collection.UpdateOne(ctx, filter, mongo.Pipeline(pipeline), opts); err == nil {
+			return nil
+		}
+		if !mongo.IsDuplicateKeyError(err) {
+			return fmt.Errorf("upsert dedup: %w", err)
+		}
 	}
-	return nil
+	return fmt.Errorf("upsert dedup after %d attempts: %w", maxAttempts, err)
 }
 
 // Get retrieves a single message by ID

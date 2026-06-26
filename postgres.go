@@ -42,8 +42,9 @@ CREATE INDEX idx_dlq_retried_at ON event_dlq(retried_at) WHERE retried_at IS NUL
 type PostgresStoreOption func(*postgresStoreOptions)
 
 type postgresStoreOptions struct {
-	table string
-	dedup bool
+	table        string
+	dedup        bool
+	maxListLimit int
 }
 
 // WithTable sets a custom table name.
@@ -68,11 +69,23 @@ func WithPostgresDedup() PostgresStoreOption {
 	}
 }
 
+// WithPostgresMaxListLimit caps the number of messages a single List returns
+// (default 0 = unbounded). A List with no Limit, or a Limit above the cap, is
+// clamped to the cap; Count is unaffected.
+func WithPostgresMaxListLimit(n int) PostgresStoreOption {
+	return func(o *postgresStoreOptions) {
+		if n > 0 {
+			o.maxListLimit = n
+		}
+	}
+}
+
 // PostgresStore is a PostgreSQL-based DLQ store
 type PostgresStore struct {
-	db    *sql.DB
-	table string
-	dedup bool
+	db           *sql.DB
+	table        string
+	dedup        bool
+	maxListLimit int
 }
 
 // NewPostgresStore creates a new PostgreSQL DLQ store.
@@ -94,9 +107,10 @@ func NewPostgresStore(db *sql.DB, opts ...PostgresStoreOption) (*PostgresStore, 
 	}
 
 	return &PostgresStore{
-		db:    db,
-		table: o.table,
-		dedup: o.dedup,
+		db:           db,
+		table:        o.table,
+		dedup:        o.dedup,
+		maxListLimit: o.maxListLimit,
 	}, nil
 }
 
@@ -334,6 +348,7 @@ func (s *PostgresStore) Get(ctx context.Context, id string) (*Message, error) {
 
 // List returns messages matching the filter
 func (s *PostgresStore) List(ctx context.Context, filter Filter) ([]*Message, error) {
+	filter = clampListLimit(filter, s.maxListLimit)
 	query, args := s.buildListQuery(filter, false)
 
 	rows, err := s.db.QueryContext(ctx, query, args...)

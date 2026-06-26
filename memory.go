@@ -12,10 +12,11 @@ import (
 
 // MemoryStore is an in-memory DLQ store for testing
 type MemoryStore struct {
-	mu       sync.RWMutex
-	messages map[string]*Message
-	byKey    map[string]string // dedupKey(eventName, originalID) -> message ID
-	dedup    bool
+	mu           sync.RWMutex
+	messages     map[string]*Message
+	byKey        map[string]string // dedupKey(eventName, originalID) -> message ID
+	dedup        bool
+	maxListLimit int // when >0, caps a single List's result size
 }
 
 // MemoryStoreOption configures a MemoryStore.
@@ -26,6 +27,17 @@ type MemoryStoreOption func(*MemoryStore)
 // the existing row instead of inserting a new one. Default: off.
 func WithMemoryDedup() MemoryStoreOption {
 	return func(s *MemoryStore) { s.dedup = true }
+}
+
+// WithMemoryMaxListLimit caps the number of messages a single List returns
+// (default 0 = unbounded). A List with no Limit, or a Limit above the cap, is
+// clamped to the cap; Count is unaffected.
+func WithMemoryMaxListLimit(n int) MemoryStoreOption {
+	return func(s *MemoryStore) {
+		if n > 0 {
+			s.maxListLimit = n
+		}
+	}
 }
 
 // dedupKey returns the composite dedup index key for a (eventName, originalID) pair.
@@ -119,6 +131,8 @@ func (s *MemoryStore) Get(ctx context.Context, id string) (*Message, error) {
 
 // List returns messages matching the filter
 func (s *MemoryStore) List(ctx context.Context, filter Filter) ([]*Message, error) {
+	filter = clampListLimit(filter, s.maxListLimit)
+
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 

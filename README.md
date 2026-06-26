@@ -484,10 +484,13 @@ and therefore the security boundary. Keep the following in mind:
   read and act on every stored message. Gate these behind your own authz, and
   configure TLS/credentials on the `*sql.DB` / `mongo.Client` / `redis.Client`
   you inject.
-- **Bound large queries.** `List`/`Count` with no `Filter.Limit` return every
-  match; always set a `Limit` in production. For Redis, `NewRedisStore(client,
-  dlq.WithMaxListLimit(n))` caps result size (and Redis always fetches the range
-  in bounded chunks regardless), so an unbounded query can't exhaust memory.
+- **Bound large queries.** `List` with no `Filter.Limit` returns every match;
+  always set a `Limit` in production. Each store accepts an opt-in cap on a
+  single `List`'s result size — `WithMemoryMaxListLimit`, `WithPostgresMaxListLimit`,
+  `WithMongoMaxListLimit`, and `WithRedisMaxListLimit(n)` — defaulting to
+  unbounded. `Count` is never capped (it returns the true total). Redis
+  additionally fetches the range in bounded chunks regardless of the cap, so an
+  unbounded query can't balloon application memory.
 
 ## Examples
 

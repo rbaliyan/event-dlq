@@ -127,8 +127,9 @@ type cappedInfo struct {
 type MongoStoreOption func(*mongoStoreOptions)
 
 type mongoStoreOptions struct {
-	collection string
-	dedup      bool
+	collection   string
+	dedup        bool
+	maxListLimit int
 }
 
 // WithCollection sets a custom collection name.
@@ -148,11 +149,23 @@ func WithMongoDedup() MongoStoreOption {
 	return func(o *mongoStoreOptions) { o.dedup = true }
 }
 
+// WithMongoMaxListLimit caps the number of messages a single List returns
+// (default 0 = unbounded). A List with no Limit, or a Limit above the cap, is
+// clamped to the cap; Count is unaffected.
+func WithMongoMaxListLimit(n int) MongoStoreOption {
+	return func(o *mongoStoreOptions) {
+		if n > 0 {
+			o.maxListLimit = n
+		}
+	}
+}
+
 // MongoStore is a MongoDB-based DLQ store
 type MongoStore struct {
-	collection *mongo.Collection
-	dedup      bool        // Whether dedup upsert is enabled (off by default)
-	cappedMu   sync.Mutex  // Protects capped fields
+	collection   *mongo.Collection
+	dedup        bool       // Whether dedup upsert is enabled (off by default)
+	maxListLimit int        // when >0, caps a single List's result size
+	cappedMu     sync.Mutex // Protects capped fields
 	cappedDone bool        // Whether capped info has been fetched
 	cappedInfo *cappedInfo // Cached capped info (nil = not checked yet)
 	cappedErr  error       // Error from first capped info fetch
@@ -173,8 +186,9 @@ func NewMongoStore(db *mongo.Database, opts ...MongoStoreOption) (*MongoStore, e
 	}
 
 	s := &MongoStore{
-		collection: db.Collection(o.collection),
-		dedup:      o.dedup,
+		collection:   db.Collection(o.collection),
+		dedup:        o.dedup,
+		maxListLimit: o.maxListLimit,
 	}
 	go func() { // #nosec G118 — background goroutine intentionally outlives constructor context
 		// Bound the background index build so it can't hang forever against a
@@ -487,6 +501,7 @@ func (s *MongoStore) Get(ctx context.Context, id string) (*Message, error) {
 
 // List returns messages matching the filter
 func (s *MongoStore) List(ctx context.Context, filter Filter) ([]*Message, error) {
+	filter = clampListLimit(filter, s.maxListLimit)
 	mongoFilter := s.buildFilter(filter)
 
 	opts := options.Find().SetSort(bson.D{{Key: "created_at", Value: -1}})

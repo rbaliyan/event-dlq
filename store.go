@@ -181,6 +181,17 @@ type Store interface {
 	GetByOriginalID(ctx context.Context, originalID string) (*Message, error)
 }
 
+// clampListLimit applies a configured maximum to a filter's Limit for List
+// queries: a Limit of 0 (meaning "all") or one greater than max is reduced to
+// max. A max of 0 means unbounded (no clamp). It never widens a smaller
+// explicit Limit. Used by the stores to bound a single List's result size.
+func clampListLimit(filter Filter, max int) Filter {
+	if max > 0 && (filter.Limit <= 0 || filter.Limit > max) {
+		filter.Limit = max
+	}
+	return filter
+}
+
 // Stats provides DLQ statistics.
 //
 // Used for monitoring and alerting on DLQ health.

@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"fmt"
 	"os"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -652,4 +653,69 @@ func TestMongoErrorFilterMatchesLiterally(t *testing.T) {
 		t.Fatalf("literal Error filter %q must match only lit-1, got %d results %+v",
 			"(timeout)", len(got), got)
 	}
+}
+
+// TestMaxListLimitRealBackends verifies the opt-in List cap on the real SQL and
+// document backends: List clamps to the cap while Count returns the true total.
+func TestMaxListLimitRealBackends(t *testing.T) {
+	ctx := context.Background()
+
+	seed := func(t *testing.T, store Store, n int) {
+		t.Helper()
+		for i := 0; i < n; i++ {
+			if err := store.Store(ctx, &Message{
+				ID: "c-" + strconv.Itoa(i), EventName: "e", OriginalID: "co-" + strconv.Itoa(i),
+				Payload: []byte(`{}`), CreatedAt: time.Now(),
+			}); err != nil {
+				t.Fatalf("seed %d: %v", i, err)
+			}
+		}
+	}
+	assertCap := func(t *testing.T, store Store) {
+		t.Helper()
+		got, err := store.List(ctx, Filter{})
+		if err != nil {
+			t.Fatalf("List: %v", err)
+		}
+		if len(got) != 3 {
+			t.Fatalf("List with no Limit must clamp to 3, got %d", len(got))
+		}
+		count, err := store.Count(ctx, Filter{})
+		if err != nil {
+			t.Fatalf("Count: %v", err)
+		}
+		if count != 10 {
+			t.Fatalf("Count must be the true total 10, got %d", count)
+		}
+	}
+
+	t.Run("postgres", func(t *testing.T) {
+		db := getPostgresDB(t)
+		table := uniqueName("dlq_cap")
+		store, err := NewPostgresStore(db, WithTable(table), WithPostgresMaxListLimit(3))
+		if err != nil {
+			t.Fatalf("NewPostgresStore: %v", err)
+		}
+		if err := store.EnsureTable(ctx); err != nil {
+			t.Fatalf("EnsureTable: %v", err)
+		}
+		t.Cleanup(func() { _, _ = db.Exec("DROP TABLE IF EXISTS " + table) })
+		seed(t, store, 10)
+		assertCap(t, store)
+	})
+
+	t.Run("mongo", func(t *testing.T) {
+		client := getMongoClient(t)
+		db := client.Database(uniqueName("dlq_cap"))
+		t.Cleanup(func() { _ = db.Drop(context.Background()) })
+		store, err := NewMongoStore(db, WithCollection("dlq_messages"), WithMongoMaxListLimit(3))
+		if err != nil {
+			t.Fatalf("NewMongoStore: %v", err)
+		}
+		if err := store.EnsureIndexes(ctx); err != nil {
+			t.Fatalf("EnsureIndexes: %v", err)
+		}
+		seed(t, store, 10)
+		assertCap(t, store)
+	})
 }

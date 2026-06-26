@@ -24,6 +24,7 @@ target can't be silently left un-fuzzed.
 | `FuzzRedisParseMessage` | `RedisStore.parseMessage` (JSON + int decode of Redis hash data) | never panics; on success the mapped fields, parsed counts, and timestamps round-trip |
 | `FuzzMemoryDedupUpsert` | dedup re-store path (`MemoryStore.Store` with dedup on) | second store of the same key collapses to one row: retry_count+1, latest error/payload/metadata, created_at preserved, retried_at cleared; empty OriginalID inserts distinct |
 | `FuzzMongoDecode` | `decodeMongoDoc` (BSON unmarshal of Mongo `Get`/`List` documents) | never panics on arbitrary bytes; malformed BSON is rejected; a successful decode yields a non-nil message |
+| `FuzzPostgresDecode` | `decodePostgresRow` (JSONB metadata unmarshal + nullable column mapping for Postgres `Get`/`List`) | never panics on arbitrary metadata; nullable scalars map deterministically; invalid-JSON metadata is reported |
 
 ## Running locally
 

@@ -304,6 +304,21 @@ func (s *PostgresStore) storeDedupFallback(ctx context.Context, msg *Message, me
 
 // Get retrieves a single message by ID
 // #nosec G201 -- table name is set at construction, not user input
+// decodePostgresRow applies the non-scalar scanned columns onto msg: it
+// unmarshals the JSONB metadata (untrusted row data) and resolves the nullable
+// source/timestamp columns. Centralizing it keeps Get/List/GetByOriginalID
+// consistent and lets the metadata decode be fuzzed (FuzzPostgresDecode) without
+// a live database. It returns the metadata-unmarshal error; callers historically
+// ignore it (malformed metadata yields an empty map), and that behavior is kept.
+func decodePostgresRow(msg *Message, metadata []byte, source sql.NullString, retriedAt, quarantinedAt sql.NullTime) error {
+	var err error
+	msg.Metadata, err = base.UnmarshalMetadata(metadata)
+	msg.RetriedAt = base.NullTime(retriedAt)
+	msg.QuarantinedAt = base.NullTime(quarantinedAt)
+	msg.Source = base.NullString(source)
+	return err
+}
+
 func (s *PostgresStore) Get(ctx context.Context, id string) (*Message, error) {
 	query := fmt.Sprintf(`
 		SELECT id, event_name, original_id, payload, metadata, error, retry_count, source, created_at, retried_at, quarantined_at
@@ -338,10 +353,7 @@ func (s *PostgresStore) Get(ctx context.Context, id string) (*Message, error) {
 		return nil, fmt.Errorf("query: %w", err)
 	}
 
-	msg.Metadata, _ = base.UnmarshalMetadata(metadata)
-	msg.RetriedAt = base.NullTime(retriedAt)
-	msg.QuarantinedAt = base.NullTime(quarantinedAt)
-	msg.Source = base.NullString(source)
+	_ = decodePostgresRow(&msg, metadata, source, retriedAt, quarantinedAt)
 
 	return &msg, nil
 }
@@ -382,10 +394,7 @@ func (s *PostgresStore) List(ctx context.Context, filter Filter) ([]*Message, er
 			return nil, fmt.Errorf("scan: %w", err)
 		}
 
-		msg.Metadata, _ = base.UnmarshalMetadata(metadata)
-		msg.RetriedAt = base.NullTime(retriedAt)
-		msg.QuarantinedAt = base.NullTime(quarantinedAt)
-		msg.Source = base.NullString(source)
+		_ = decodePostgresRow(&msg, metadata, source, retriedAt, quarantinedAt)
 
 		messages = append(messages, &msg)
 	}
@@ -647,10 +656,7 @@ func (s *PostgresStore) GetByOriginalID(ctx context.Context, originalID string) 
 		return nil, fmt.Errorf("query: %w", err)
 	}
 
-	msg.Metadata, _ = base.UnmarshalMetadata(metadata)
-	msg.RetriedAt = base.NullTime(retriedAt)
-	msg.QuarantinedAt = base.NullTime(quarantinedAt)
-	msg.Source = base.NullString(source)
+	_ = decodePostgresRow(&msg, metadata, source, retriedAt, quarantinedAt)
 
 	return &msg, nil
 }

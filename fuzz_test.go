@@ -2,6 +2,7 @@ package dlq
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"strconv"
 	"strings"
@@ -429,4 +430,45 @@ func assertOptionalTime(t *testing.T, field, raw string, got *time.Time) {
 			t.Errorf("%s: got %d want %d", field, got.Unix(), unix)
 		}
 	}
+}
+
+// FuzzPostgresDecode fuzzes decodePostgresRow — the Postgres row-mapping path
+// that unmarshals untrusted JSONB metadata and resolves the nullable columns.
+// It must never panic on arbitrary metadata bytes, and the scalar/null columns
+// must map deterministically.
+func FuzzPostgresDecode(f *testing.F) {
+	f.Add([]byte(`{"trace":"abc"}`), "svc", true, true, false)
+	f.Add([]byte(``), "", false, false, false)
+	f.Add([]byte(`not json`), "", false, false, false)
+	f.Add([]byte(`{"n":1}`), "x", true, false, true) // valid JSON, non-string value
+	f.Add([]byte(`[1,2,3]`), "", true, true, true)    // valid JSON, not an object
+
+	f.Fuzz(func(t *testing.T, metadata []byte, source string, sourceValid, retriedValid, quarantinedValid bool) {
+		var msg Message
+		ns := sql.NullString{String: source, Valid: sourceValid}
+		retriedAt := sql.NullTime{Time: time.Unix(1700000000, 0), Valid: retriedValid}
+		quarantinedAt := sql.NullTime{Time: time.Unix(1700000100, 0), Valid: quarantinedValid}
+
+		// Must not panic on arbitrary metadata bytes.
+		err := decodePostgresRow(&msg, metadata, ns, retriedAt, quarantinedAt)
+
+		// Nullable scalars map deterministically.
+		if sourceValid && msg.Source != source {
+			t.Errorf("source: got %q want %q", msg.Source, source)
+		}
+		if !sourceValid && msg.Source != "" {
+			t.Errorf("invalid source must map to empty, got %q", msg.Source)
+		}
+		if (msg.RetriedAt != nil) != retriedValid {
+			t.Errorf("retried_at pointer presence %v != valid %v", msg.RetriedAt != nil, retriedValid)
+		}
+		if (msg.QuarantinedAt != nil) != quarantinedValid {
+			t.Errorf("quarantined_at pointer presence %v != valid %v", msg.QuarantinedAt != nil, quarantinedValid)
+		}
+		// Invalid-JSON metadata is reported as an error (and must not yield a
+		// populated map); valid JSON yields no error.
+		if len(metadata) > 0 && !json.Valid(metadata) && err == nil {
+			t.Errorf("invalid JSON metadata %q should report an error", metadata)
+		}
+	})
 }

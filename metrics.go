@@ -26,7 +26,8 @@ const (
 //   - dlq_messages_total: Counter of messages sent to DLQ (by event, error_type)
 //   - dlq_messages_replayed_total: Counter of messages replayed
 //   - dlq_messages_deleted_total: Counter of messages deleted/cleaned up
-//   - dlq_messages_pending: Gauge of current pending messages in DLQ
+//   - dlq_messages_pending: Best-effort per-event gauge of pending messages (in-process)
+//   - dlq_messages_pending_actual: Authoritative pending count from the store (observable; see RegisterPendingProvider)
 //   - dlq_replay_success_total: Counter of successful replays
 //   - dlq_replay_failure_total: Counter of failed replays (by event, error_type)
 //   - dlq_messages_quarantined_total: Counter of quarantines (by event, reason)
@@ -54,6 +55,11 @@ type Metrics struct {
 	// pendingCounts tracks pending messages per event for gauge updates
 	pendingMu     sync.RWMutex
 	pendingCounts map[string]int64
+
+	// meter is retained so an observable gauge can be registered lazily once a
+	// store-backed provider is available (see RegisterPendingProvider).
+	meter       metric.Meter
+	pendingOnce sync.Once
 }
 
 // NewMetrics creates a new Metrics instance using the global OpenTelemetry meter provider.
@@ -203,7 +209,42 @@ func NewMetricsWithProvider(provider metric.MeterProvider) (*Metrics, error) {
 		messageAge:               messageAge,
 		storeOpDuration:          storeOpDuration,
 		pendingCounts:            make(map[string]int64),
+		meter:                    meter,
 	}, nil
+}
+
+// RegisterPendingProvider registers an observable gauge, dlq_messages_pending_actual,
+// whose value is sourced authoritatively from the provider on every metric
+// collection. Unlike the imperative dlq_messages_pending gauge (a process-local
+// counter that can drift across bulk deletes, restarts, or multiple managers),
+// this reflects the real store state and reconciles automatically.
+//
+// The Manager calls this with a provider backed by store.Count when metrics are
+// enabled. It registers at most once per Metrics instance (subsequent calls are
+// no-ops), so the gauge is not double-counted when a Metrics is shared.
+//
+// The provider runs a store Count on each collection; at very short scrape
+// intervals this adds load to the backend.
+func (m *Metrics) RegisterPendingProvider(provider func(context.Context) (int64, error)) error {
+	if m == nil || provider == nil {
+		return nil
+	}
+	var regErr error
+	m.pendingOnce.Do(func() {
+		_, regErr = m.meter.Int64ObservableGauge("dlq_messages_pending_actual",
+			metric.WithDescription("Authoritative pending message count, queried from the store on collection"),
+			metric.WithUnit("{message}"),
+			metric.WithInt64Callback(func(ctx context.Context, o metric.Int64Observer) error {
+				n, err := provider(ctx)
+				if err != nil {
+					return err
+				}
+				o.Observe(n)
+				return nil
+			}),
+		)
+	})
+	return regErr
 }
 
 // RecordMessageStored records that a message was stored in the DLQ.

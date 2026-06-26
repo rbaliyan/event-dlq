@@ -2,6 +2,7 @@ package dlq
 
 import (
 	"context"
+	"strconv"
 	"testing"
 	"time"
 
@@ -50,13 +51,18 @@ func sumInt64(t *testing.T, reader sdkmetric.Reader, name string) int64 {
 			if m.Name != name {
 				continue
 			}
-			sum, ok := m.Data.(metricdata.Sum[int64])
-			if !ok {
-				t.Fatalf("%s has unexpected data type %T", name, m.Data)
-			}
 			var total int64
-			for _, dp := range sum.DataPoints {
-				total += dp.Value
+			switch d := m.Data.(type) {
+			case metricdata.Sum[int64]:
+				for _, dp := range d.DataPoints {
+					total += dp.Value
+				}
+			case metricdata.Gauge[int64]:
+				for _, dp := range d.DataPoints {
+					total += dp.Value
+				}
+			default:
+				t.Fatalf("%s has unexpected data type %T", name, m.Data)
 			}
 			return total
 		}
@@ -332,4 +338,53 @@ func TestStoreOpDurationRecorded(t *testing.T) {
 func TestRecordStoreOpDurationNilSafe(t *testing.T) {
 	var m *Metrics
 	m.RecordStoreOpDuration(context.Background(), "list", "memory", time.Second)
+}
+
+// TestPendingActualObservableGauge verifies the authoritative pending gauge
+// reflects the real store state (total minus retried/quarantined) on collection,
+// independent of the imperative gauge's bookkeeping.
+func TestPendingActualObservableGauge(t *testing.T) {
+	ctx := context.Background()
+	m, reader := newTestMetrics(t)
+	store := NewMemoryStore()
+	if _, err := NewManager(store, &countingRepublisher{}, WithMetrics(m)); err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+
+	for i := 0; i < 3; i++ {
+		if err := store.Store(ctx, &Message{
+			ID: "p-" + strconv.Itoa(i), EventName: "e", OriginalID: "o-" + strconv.Itoa(i),
+			Payload: []byte(`{}`), CreatedAt: time.Now(),
+		}); err != nil {
+			t.Fatalf("store: %v", err)
+		}
+	}
+	// One retried -> excluded from pending.
+	if err := store.MarkRetried(ctx, "p-0"); err != nil {
+		t.Fatalf("mark retried: %v", err)
+	}
+
+	if got := sumInt64(t, reader, "dlq_messages_pending_actual"); got != 2 {
+		t.Fatalf("dlq_messages_pending_actual = %d, want 2 (3 stored - 1 retried)", got)
+	}
+
+	// Bulk-delete the rest: the authoritative gauge reconciles automatically.
+	if _, err := store.DeleteByFilter(ctx, Filter{EventName: "e"}); err != nil {
+		t.Fatalf("delete by filter: %v", err)
+	}
+	if got := sumInt64(t, reader, "dlq_messages_pending_actual"); got != 0 {
+		t.Fatalf("dlq_messages_pending_actual after bulk delete = %d, want 0", got)
+	}
+}
+
+// TestRegisterPendingProviderNilSafe verifies nil-receiver and nil-provider guards.
+func TestRegisterPendingProviderNilSafe(t *testing.T) {
+	var m *Metrics
+	if err := m.RegisterPendingProvider(func(context.Context) (int64, error) { return 0, nil }); err != nil {
+		t.Fatalf("nil metrics: %v", err)
+	}
+	real, _ := newTestMetrics(t)
+	if err := real.RegisterPendingProvider(nil); err != nil {
+		t.Fatalf("nil provider: %v", err)
+	}
 }

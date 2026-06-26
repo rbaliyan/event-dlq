@@ -350,7 +350,7 @@ func NewManager(store Store, r Republisher, opts ...ManagerOption) (*Manager, er
 		opt(o)
 	}
 
-	return &Manager{
+	m := &Manager{
 		store:             store,
 		republisher:       r,
 		logger:            o.logger,
@@ -359,7 +359,19 @@ func NewManager(store Store, r Republisher, opts ...ManagerOption) (*Manager, er
 		maxRetries:        o.maxRetries,
 		terminalError:     o.terminalError,
 		maxReplayAttempts: o.maxReplayAttempts,
-	}, nil
+	}
+
+	// Back the authoritative pending gauge with this manager's store so it
+	// reflects real state (drift-free) rather than the process-local counter.
+	if m.metrics != nil {
+		if err := m.metrics.RegisterPendingProvider(func(ctx context.Context) (int64, error) {
+			return m.store.Count(ctx, Filter{ExcludeRetried: true, ExcludeQuarantined: true})
+		}); err != nil {
+			return nil, fmt.Errorf("manager: register pending gauge: %w", err)
+		}
+	}
+
+	return m, nil
 }
 
 // NewManagerWithTransport creates a DLQ manager using a transport for replay.

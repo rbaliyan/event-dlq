@@ -302,3 +302,34 @@ func TestNewRecordersNilSafe(t *testing.T) {
 	m.RecordReplayAttempts(ctx, "e", 1)
 	m.RecordMessageAge(ctx, "e", time.Now())
 }
+
+// TestStoreOpDurationRecorded verifies the Manager records a store-op duration
+// sample for each backend call it makes.
+func TestStoreOpDurationRecorded(t *testing.T) {
+	ctx := context.Background()
+	m, reader := newTestMetrics(t)
+	mgr, err := NewManager(NewMemoryStore(), &countingRepublisher{}, WithMetrics(m))
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+
+	if err := mgr.Store(ctx, StoreParams{EventName: "e", OriginalID: "o1", Payload: []byte(`{}`)}); err != nil {
+		t.Fatalf("Store: %v", err)
+	}
+	if _, err := mgr.List(ctx, Filter{}); err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if _, err := mgr.Count(ctx, Filter{}); err != nil {
+		t.Fatalf("Count: %v", err)
+	}
+
+	if got := histogramCount(t, reader, "dlq_store_op_duration_seconds"); got < 3 {
+		t.Fatalf("dlq_store_op_duration_seconds samples = %d, want >= 3 (store, list, count)", got)
+	}
+}
+
+// TestRecordStoreOpDurationNilSafe verifies the nil-receiver guard.
+func TestRecordStoreOpDurationNilSafe(t *testing.T) {
+	var m *Metrics
+	m.RecordStoreOpDuration(context.Background(), "list", "memory", time.Second)
+}

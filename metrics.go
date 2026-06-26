@@ -32,6 +32,7 @@ const (
 //   - dlq_messages_quarantined_total: Counter of quarantines (by event, reason)
 //   - dlq_messages_quarantined: Gauge of currently-quarantined messages
 //   - dlq_store_errors_total: Counter of store operation failures (by op, backend)
+//   - dlq_store_op_duration_seconds: Histogram of store operation duration (by op, backend)
 //   - dlq_replay_duration_seconds: Histogram of replay attempt duration
 //   - dlq_replay_attempts: Histogram of attempts per replay
 //   - dlq_message_age_seconds: Histogram of message age when it leaves the DLQ
@@ -48,6 +49,7 @@ type Metrics struct {
 	replayDuration           metric.Float64Histogram
 	replayAttempts           metric.Int64Histogram
 	messageAge               metric.Float64Histogram
+	storeOpDuration          metric.Float64Histogram
 
 	// pendingCounts tracks pending messages per event for gauge updates
 	pendingMu     sync.RWMutex
@@ -177,6 +179,15 @@ func NewMetricsWithProvider(provider metric.MeterProvider) (*Metrics, error) {
 		return nil, err
 	}
 
+	storeOpDuration, err := meter.Float64Histogram("dlq_store_op_duration_seconds",
+		metric.WithDescription("Duration of a backend store operation, by operation and backend"),
+		metric.WithUnit("s"),
+		metric.WithExplicitBucketBoundaries(0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5),
+	)
+	if err != nil {
+		return nil, err
+	}
+
 	return &Metrics{
 		messagesTotal:            messagesTotal,
 		messagesReplayedTotal:    messagesReplayedTotal,
@@ -190,6 +201,7 @@ func NewMetricsWithProvider(provider metric.MeterProvider) (*Metrics, error) {
 		replayDuration:           replayDuration,
 		replayAttempts:           replayAttempts,
 		messageAge:               messageAge,
+		storeOpDuration:          storeOpDuration,
 		pendingCounts:            make(map[string]int64),
 	}, nil
 }
@@ -363,6 +375,18 @@ func (m *Metrics) RecordStoreError(ctx context.Context, op, backend string) {
 		return
 	}
 	m.storeErrorsTotal.Add(ctx, 1, metric.WithAttributes(
+		attribute.String("op", op),
+		attribute.String("backend", backend),
+	))
+}
+
+// RecordStoreOpDuration records how long a backend store operation took,
+// labelled by operation and backend (both bounded enums).
+func (m *Metrics) RecordStoreOpDuration(ctx context.Context, op, backend string, d time.Duration) {
+	if m == nil {
+		return
+	}
+	m.storeOpDuration.Record(ctx, d.Seconds(), metric.WithAttributes(
 		attribute.String("op", op),
 		attribute.String("backend", backend),
 	))

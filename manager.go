@@ -404,7 +404,17 @@ func (m *Manager) backend() string {
 	return "unknown"
 }
 
+// timeStoreOp starts a timer for a store operation and returns a function that
+// records its duration when called. Use as: defer m.timeStoreOp(ctx, "list")().
+func (m *Manager) timeStoreOp(ctx context.Context, op string) func() {
+	start := time.Now()
+	return func() {
+		m.metrics.RecordStoreOpDuration(ctx, op, m.backend(), time.Since(start))
+	}
+}
+
 func (m *Manager) Store(ctx context.Context, params StoreParams) error {
+	defer m.timeStoreOp(ctx, "store")()
 	var errMsg string
 	if params.Err != nil {
 		errMsg = params.Err.Error()
@@ -446,6 +456,7 @@ func (m *Manager) Store(ctx context.Context, params StoreParams) error {
 
 // Get retrieves a single DLQ message
 func (m *Manager) Get(ctx context.Context, id string) (*Message, error) {
+	defer m.timeStoreOp(ctx, "get")()
 	return m.store.Get(ctx, id)
 }
 
@@ -453,16 +464,19 @@ func (m *Manager) Get(ctx context.Context, id string) (*Message, error) {
 // ID (the ID of the message that originally failed), rather than by the
 // generated DLQ ID. Returns ErrNotFound if no message has that original ID.
 func (m *Manager) GetByOriginalID(ctx context.Context, originalID string) (*Message, error) {
+	defer m.timeStoreOp(ctx, "get_by_original_id")()
 	return m.store.GetByOriginalID(ctx, originalID)
 }
 
 // List returns DLQ messages matching the filter
 func (m *Manager) List(ctx context.Context, filter Filter) ([]*Message, error) {
+	defer m.timeStoreOp(ctx, "list")()
 	return m.store.List(ctx, filter)
 }
 
 // Count returns the number of messages matching the filter
 func (m *Manager) Count(ctx context.Context, filter Filter) (int64, error) {
+	defer m.timeStoreOp(ctx, "count")()
 	return m.store.Count(ctx, filter)
 }
 
@@ -712,6 +726,7 @@ func (m *Manager) replayMessage(ctx context.Context, msg *Message) error {
 
 // Delete removes a message from the DLQ
 func (m *Manager) Delete(ctx context.Context, id string) error {
+	defer m.timeStoreOp(ctx, "delete")()
 	// Get message first to record metrics with event name
 	msg, err := m.store.Get(ctx, id)
 	if err != nil {
@@ -732,6 +747,7 @@ func (m *Manager) Delete(ctx context.Context, id string) error {
 
 // DeleteByFilter removes messages matching the filter
 func (m *Manager) DeleteByFilter(ctx context.Context, filter Filter) (int64, error) {
+	defer m.timeStoreOp(ctx, "delete_by_filter")()
 	deleted, err := m.store.DeleteByFilter(ctx, filter)
 	if err != nil {
 		m.metrics.RecordStoreError(ctx, "delete_by_filter", m.backend())
@@ -745,6 +761,7 @@ func (m *Manager) DeleteByFilter(ctx context.Context, filter Filter) (int64, err
 
 // Cleanup removes messages older than the specified age
 func (m *Manager) Cleanup(ctx context.Context, age time.Duration) (int64, error) {
+	defer m.timeStoreOp(ctx, "delete_older_than")()
 	deleted, err := m.store.DeleteOlderThan(ctx, age)
 	if err != nil {
 		m.metrics.RecordStoreError(ctx, "delete_older_than", m.backend())

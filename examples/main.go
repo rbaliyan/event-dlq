@@ -24,6 +24,7 @@ import (
 	"github.com/rbaliyan/event-mongodb"
 	"github.com/rbaliyan/event-mongodb/outbox"
 	event "github.com/rbaliyan/event/v3"
+	evtoutbox "github.com/rbaliyan/event/v3/outbox"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
@@ -210,17 +211,17 @@ func main() {
 	// STEP 7: Setup Outbox Relay (Background Publisher)
 	// ============================================================
 
-	relayTokenStore, err := outbox.NewMongoResumeTokenStore(internalDB, "outbox-relay")
-	if err != nil {
-		logger.Error("failed to create relay resume token store", "error", err)
-		os.Exit(1)
-	}
-
-	relay := outbox.NewMongoRelay(outboxStore, transport).
-		WithMode(outbox.RelayModeChangeStream). // Real-time with change streams
-		WithResumeTokenStore(relayTokenStore).
-		WithStuckDuration(5 * time.Minute). // Recover stuck messages
-		WithLogger(logger)
+	// The relay engine now lives in event/v3's outbox package and drives any
+	// store satisfying its generic Store contract. The Mongo outbox store
+	// implements the optional Waker interface (backed by a change stream), so
+	// the relay still wakes in near-real-time on new writes instead of waiting
+	// for the next poll tick. Resume tokens and an explicit change-stream mode
+	// are no longer needed — the relay claims pending rows and recovers stuck
+	// ones via the StuckRecoverer contract.
+	relay := evtoutbox.NewRelay(outboxStore, transport,
+		evtoutbox.WithLogger(logger),
+		evtoutbox.WithStuckInterval(time.Minute, 5*time.Minute), // sweep and reclaim stuck messages
+	)
 
 	// Start relay in background
 	go func() {

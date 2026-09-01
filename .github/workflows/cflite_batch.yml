@@ -32,6 +32,18 @@ jobs:
           mode: batch
           fuzz-seconds: 3600
           output-sarif: true
+          # Do not treat libFuzzer per-input timeouts as bugs. The Go targets
+          # are built through go-118-fuzz-build, whose go-fuzz-headers consumer
+          # expands bogus length prefixes in the fuzzer input into very large
+          # buffers before the code under test is ever called. That is harness
+          # work, not product work: the 124-byte input that timed out at 31s
+          # returns from decodeMongoDoc in 264us when fed to it directly.
+          # Raising the limit is not an option -- ClusterFuzzLite's cifuzz
+          # runner builds libFuzzer arguments programmatically and never reads
+          # the per-fuzzer .options files that OSS-Fuzz proper honours.
+          # Crashes and OOMs remain reportable; only "timeout-*" testcases are
+          # suppressed (cifuzz: `if testcase.startswith('timeout-')`).
+          report-timeouts: false
 
       - name: Upload SARIF
         if: always() && steps.run.outcome != 'skipped'
